@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DeepSeek Harness Desktop - Universal 1-Line Installer for macOS
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/deepseek-ai/deepseek-harness-desktop/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/imMamdouhaboammar/deepseek-harness-desktop/main/install.sh | bash
 set -e
 
 BOLD="\033[1m"
@@ -75,10 +75,10 @@ else
   echo -e "Fetching latest release into ${CYAN}${INSTALL_DIR}${RESET}..."
   rm -rf "$INSTALL_DIR"
   if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness-desktop.git "$INSTALL_DIR"
+    git clone --depth 1 https://github.com/imMamdouhaboammar/deepseek-harness-desktop.git "$INSTALL_DIR"
   else
     mkdir -p "$INSTALL_DIR"
-    curl -fsSL https://github.com/deepseek-ai/deepseek-harness-desktop/archive/refs/heads/main.tar.gz | tar -xz -C "$INSTALL_DIR" --strip-components=1
+    curl -fsSL https://github.com/imMamdouhaboammar/deepseek-harness-desktop/archive/refs/heads/main.tar.gz | tar -xz -C "$INSTALL_DIR" --strip-components=1
   fi
 fi
 

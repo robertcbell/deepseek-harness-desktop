@@ -1,10 +1,19 @@
 {
-  "name": "deepseek-harness-desktop",
+  "name": "deepseek-harness-macos",
   "version": "0.0.1",
   "description": "DeepSeek Harness native macOS desktop app, background daemon, and autonomous agent environment manager",
   "main": "bin/dsh-desktop.mjs",
   "bin": {
-    "dsh-desktop": "./bin/dsh-desktop.mjs"
+    "dsh-desktop": "./bin/dsh-desktop.mjs",
+    "deepseek-harness-macos": "./bin/dsh-desktop.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imMamdouhaboammar/deepseek-harness-desktop.git"
+  },
+  "homepage": "https://github.com/imMamdouhaboammar/deepseek-harness-desktop#readme",
+  "bugs": {
+    "url": "https://github.com/imMamdouhaboammar/deepseek-harness-desktop/issues"
   },
   "type": "module",
   "scripts": {

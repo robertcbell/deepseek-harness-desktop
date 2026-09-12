@@ -1,8 +1,8 @@
 # DeepSeek Harness Desktop (macOS) 🚀
 
-[![CI](https://github.com/deepseek-ai/deepseek-harness-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/deepseek-ai/deepseek-harness-desktop/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/deepseek-ai/deepseek-harness-desktop?color=blue)](https://github.com/deepseek-ai/deepseek-harness-desktop/releases)
-[![npm version](https://img.shields.io/npm/v/deepseek-harness-desktop?color=green)](https://www.npmjs.com/package/deepseek-harness-desktop)
+[![CI](https://github.com/imMamdouhaboammar/deepseek-harness-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/imMamdouhaboammar/deepseek-harness-desktop/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/imMamdouhaboammar/deepseek-harness-desktop?color=blue)](https://github.com/imMamdouhaboammar/deepseek-harness-desktop/releases)
+[![npm version](https://img.shields.io/npm/v/deepseek-harness-macos?color=green)](https://www.npmjs.com/package/deepseek-harness-macos)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **The complete, installable macOS desktop app & daemon environment for DeepSeek Harness (`dsh`).**  
@@ -26,17 +26,17 @@
 ### 1. One-Line Install (Recommended)
 Open Terminal and run:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deepseek-ai/deepseek-harness-desktop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/imMamdouhaboammar/deepseek-harness-desktop/main/install.sh | bash
 ```
 
 ### 2. Via npm / Bun / npx
 Install globally or run directly:
 ```bash
 # Using npx directly
-npx deepseek-harness-desktop setup --open
+npx deepseek-harness-macos setup --open
 
 # Or install globally with Bun
-bun add -g deepseek-harness-desktop
+bun add -g deepseek-harness-macos
 dsh-desktop setup --open
 ```
 
@@ -98,7 +98,7 @@ Download the pre-compiled disk image from [GitHub Releases](https://github.com/d
 
 ```bash
 # Clone the repository
-git clone https://github.com/deepseek-ai/deepseek-harness-desktop.git
+git clone https://github.com/imMamdouhaboammar/deepseek-harness-desktop.git
 cd deepseek-harness-desktop
 
 # Install dependencies (Bun mandatory per project constitution)
@@ -127,16 +127,16 @@ bun run doctor
 
 #### 1. التثبيت السريع عبر سطر الأوامر (مستحسن):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deepseek-ai/deepseek-harness-desktop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/imMamdouhaboammar/deepseek-harness-desktop/main/install.sh | bash
 ```
 
 #### 2. التثبيت عبر npm / Bun:
 ```bash
-npx deepseek-harness-desktop setup --open
+npx deepseek-harness-macos setup --open
 ```
 
 #### 3. التثبيت اليدوي من ملف الـ DMG:
-حمّل ملف `DeepSeek-Harness-macOS.dmg` من قسم [Releases](https://github.com/deepseek-ai/deepseek-harness-desktop/releases)، ثم اسحب الأيقونة إلى مجلد التطبيقات `/Applications`.
+حمّل ملف `DeepSeek-Harness-macOS.dmg` من قسم [Releases](https://github.com/imMamdouhaboammar/deepseek-harness-desktop/releases)، ثم اسحب الأيقونة إلى مجلد التطبيقات `/Applications`.
 
 ### أهم المزايا والتحسينات المدمجة:
 1. **التشغيل الفوري من Dock**: بنقرة واحدة يعمل التطبيق كنافذة مكتبية أصلية أنيقة دون شريط عنوان مزعج (Frameless).
