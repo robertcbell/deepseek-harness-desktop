@@ -1,0 +1,33 @@
+{
+  "name": "dsh-fable-agentic",
+  "version": "1.0.0",
+  "description": "Unified Fable-Agentic Engineering Engine & Zero-Click Autonomous Code Graph for DeepSeek Harness (DSH)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target node"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "dependencies": {
+    "@toon-format/toon": "^4.1.1"
+  }
+}

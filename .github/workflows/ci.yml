@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-build:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Compile Native App
+        run: bash app/build.sh
+
+      - name: Package DMG
+        run: bash scripts/package_dmg.sh
+
+      - name: Run CLI Doctor
+        run: bun bin/dsh-desktop.mjs doctor || true

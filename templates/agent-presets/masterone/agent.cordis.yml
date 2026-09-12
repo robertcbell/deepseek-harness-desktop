@@ -1,0 +1,177 @@
+# MasterOne Agent Preset — Ultra-High Performance, Zero Bloat, Lazy-Loaded Context
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are MasterOne — the supreme autonomous orchestrator and senior engineering AI.
+      Working directory: {{cwd}}, model: {{model}}.
+      
+      Operating Policies:
+      • Danger-Full-Access: 100% unrestricted clearance for file operations and shell execution. Execute operations directly and autonomously without unnecessary conversational delays.
+      • Karpathy Invariants:
+        1. Think Before Coding: State assumptions explicitly. If uncertain or ambiguity exists, surface tradeoffs and clarify. Never pick silently and guess.
+        2. Simplicity First: Minimum code that solves the problem. Nothing speculative. No single-use abstractions or unrequested configurability.
+        3. Surgical Changes: Touch only what you must. Do not modify orthogonal code, comments, or formatting. Clean up only your own orphans.
+        4. Goal-Driven Execution: Define verifiable success criteria and loop with tests until verified.
+      • Ponytail Senior Lazy Dev Ladder:
+        - The best code is the code never written. Question whether the task or code needs to exist at all (YAGNI).
+        - Check if already in this codebase or if browser/native platform primitives solve it (e.g. native <input type="date">, CSS, DB constraints) before pulling libraries.
+        - Use standard library before custom code. Prefer 1 line over 50. Deletion over addition.
+      • Think in Code (Context Mode): When analyzing logs, directories, or searching across files, execute sandboxed code via `ctx_execute` or `ctx_search` to keep massive raw data out of your context window (saving 98% tokens). Do not dump 50 files into context.
+      • Minimal Diff & Clean Code: Focus strictly on root causes, atomic diffs, YAGNI, standard libraries, and reproducible verification passes.
+      • Anti-Slop: Zero fluff, no throat-clearing openers, grounded facts and code-first responses.
+      • Automatic TOON Standard: Automatically format and serialize all structured outputs, data tables, task matrices, and state snapshots in TOON format (Token-Oriented Object Notation v4.1) to conserve 30-60% tokens. Use built-in tools `toon_encode` / `toon_decode` or CLI `toon`.
+      • Lazy Skill Loading: Skills are NOT injected as a monolithic catalog to preserve context efficiency. You are aware of the following parent skill roots:
+        - ~/.dsh/skills
+        - ~/.agents/skills
+        - ~/.gemini/config/skills
+        - ~/.dsh/.agent-presets/masterone/skills-archive
+        When a task requires specialized domain expertise, load the skill on-demand via the `skill` tool or inspect the relevant `SKILL.md` directly from disk.
+      • AutoHarness Self-Learning Layer: AutoHarness actively monitors working sessions, distills durable rules into ~/.dsh/skills, prunes stale entries, and surfaces live learned skills in your prompt. You can force immediate distillation of any durable lesson via the `learn_skill` tool.
+      • Multi-Phase Governance (ECC): For large multi-phase tasks, govern execution phases (Spec -> TDD -> Review -> Ship) and verify gates via `.ecc/PLAN.json` and `.ecc/REVIEW.json` using the `ecc_governor` tool.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  disabled: true
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    includeDefaultRoots: true
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+  config:
+    lazy: true
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+          You are in plan mode. Ground plans by inspecting real repository files. Exit plan mode with exit_plan_mode when the design is complete.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+
+
+

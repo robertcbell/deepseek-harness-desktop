@@ -1,0 +1,57 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "0.0.1",
+  "description": "DeepSeek Harness native macOS desktop app, background daemon, and autonomous agent environment manager",
+  "main": "bin/dsh-desktop.mjs",
+  "bin": {
+    "dsh-desktop": "./bin/dsh-desktop.mjs"
+  },
+  "type": "module",
+  "scripts": {
+    "build:app": "bash app/build.sh",
+    "package:dmg": "bash scripts/package_dmg.sh",
+    "setup": "bun bin/dsh-desktop.mjs setup",
+    "start": "bun bin/dsh-desktop.mjs start",
+    "stop": "bun bin/dsh-desktop.mjs stop",
+    "restart": "bun bin/dsh-desktop.mjs restart",
+    "status": "bun bin/dsh-desktop.mjs status",
+    "doctor": "bun bin/dsh-desktop.mjs doctor",
+    "open": "bun bin/dsh-desktop.mjs open"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "macos",
+    "desktop-app",
+    "ai-agents",
+    "autonomous-agent",
+    "webkit",
+    "daemon"
+  ],
+  "author": "DeepSeek Harness Community",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "js-yaml": "^4.1.0",
+    "ora": "^8.1.0"
+  },
+  "files": [
+    "bin",
+    "app",
+    "daemon",
+    "plugins",
+    "scripts",
+    "templates",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ]
+}

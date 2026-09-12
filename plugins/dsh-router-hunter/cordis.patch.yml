@@ -1,0 +1,4 @@
+# dsh bundle patch: Universal New-API Router Hunter & Orchestrator
+- insert:
+    - id: dsh-router-hunter
+      name: 'dsh-router-hunter'

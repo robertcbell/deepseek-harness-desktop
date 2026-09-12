@@ -1,0 +1,27 @@
+# DeepSeek Harness Global Cordis Patch
+# Configures optimal tool compaction, pruning, and lazy skill loading
+
+- id: agent-instructions
+  disabled: true
+
+- id: compaction-basic
+  disabled: false
+
+- id: command-compact
+  disabled: false
+
+- id: tool-result-pruner
+  disabled: false
+
+- id: dsh-fable-agentic
+  disabled: false
+
+- id: dsh-autoharness
+  disabled: false
+
+- id: dsh-router-hunter
+  disabled: false
+
+- id: tool-skill
+  config:
+    lazy: true

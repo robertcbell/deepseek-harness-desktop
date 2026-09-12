@@ -1,0 +1,27 @@
+# Build outputs
+build/
+dist/
+*.dmg
+*.zip
+
+# Dependencies
+node_modules/
+bun.lockb
+
+# macOS system files
+.DS_Store
+*.swp
+*~
+
+# Credentials & local secrets
+.env
+.env.*
+!.env.example
+*.credentials.yaml
+!credentials.example.yaml
+*.token
+*.log
+logs/
+
+# Agent Kernel / IDE
+.planning/

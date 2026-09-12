@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.deepseek.dsh</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{{DSH_HOME}}/scripts/dsh_daemon.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{DSH_HOME}}/logs/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{DSH_HOME}}/logs/daemon.err.log</string>
+  <key>WorkingDirectory</key>
+  <string>{{DSH_HOME}}</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>

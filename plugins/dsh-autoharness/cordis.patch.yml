@@ -1,0 +1,4 @@
+# dsh bundle patch: AutoHarness Autonomous Self-Learning Skill Engine
+- insert:
+    - id: dsh-autoharness
+      name: 'dsh-autoharness'

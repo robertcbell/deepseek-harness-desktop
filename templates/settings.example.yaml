@@ -1,0 +1,27 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-09-01.1
+llm-deepseek:
+  apiKeyEnv: DEEPSEEK_API_KEY
+  baseURL: https://api.deepseek.com/v1
+  thinking: disabled
+  reasoningEffort: 'off'
+  retryPolicy:
+    mode: always
+    backoff:
+      initialDelayMs: 500
+      maxDelayMs: 10000
+      jitterRatio: 0.1
+  models:
+    - id: deepseek-chat
+      name: DeepSeek Chat
+      contextWindow: 128000
+      input:
+        - text
+    - id: deepseek-reasoner
+      name: DeepSeek Reasoner
+      contextWindow: 128000
+      input:
+        - text
+agent:
+  preset: masterone
+  maxTurns: 50

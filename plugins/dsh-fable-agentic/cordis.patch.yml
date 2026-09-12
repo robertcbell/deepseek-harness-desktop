@@ -1,0 +1,4 @@
+# dsh bundle patch: Fable-Agentic Cognitive Governor and Autonomous Code Graph
+- insert:
+    - id: dsh-fable-agentic
+      name: 'dsh-fable-agentic'

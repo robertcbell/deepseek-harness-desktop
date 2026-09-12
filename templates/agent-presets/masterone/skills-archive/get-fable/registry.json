@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "entry": "get-fable",
+  "skills": [
+    {
+      "id": "get-fable",
+      "order": 0,
+      "phase": "idle",
+      "description": "Entry router and global execution contract.",
+      "next": ["fable-discover", "fable-plan", "fable-execute", "fable-verify", "fable-recover"],
+      "keywords": ["fable", "rigorous", "frontier-like"]
+    },
+    {
+      "id": "fable-discover",
+      "order": 10,
+      "phase": "discovering",
+      "description": "Gather repository, environment, documentation, and load-bearing evidence before architecture.",
+      "next": ["fable-plan", "fable-execute", "fable-verify"],
+      "keywords": ["inspect", "explore", "research", "trace", "unknown", "documentation", "current", "latest"]
+    },
+    {
+      "id": "fable-plan",
+      "order": 20,
+      "phase": "planned",
+      "description": "Convert evidence into bounded work cards with explicit acceptance criteria.",
+      "next": ["fable-execute", "fable-discover"],
+      "keywords": ["plan", "design", "architecture", "migration", "refactor", "multi-file", "end to end"]
+    },
+    {
+      "id": "fable-execute",
+      "order": 30,
+      "phase": "executing",
+      "description": "Implement one accepted card with immediate acceptance checks and no scope drift.",
+      "next": ["fable-verify", "fable-recover"],
+      "keywords": ["implement", "fix", "add", "update", "build", "change"]
+    },
+    {
+      "id": "fable-verify",
+      "order": 40,
+      "phase": "verifying",
+      "description": "Try to falsify the implementation and collect concrete acceptance evidence.",
+      "next": ["fable-recover", "fable-execute"],
+      "keywords": ["verify", "validate", "review", "audit", "prove", "ready to ship", "before merge"]
+    },
+    {
+      "id": "fable-recover",
+      "order": 50,
+      "phase": "recovering",
+      "description": "Diagnose repeated failure, stale execution, or contradictory evidence before another edit.",
+      "next": ["fable-discover", "fable-plan", "fable-execute", "fable-verify"],
+      "keywords": ["failed twice", "same failure", "retry", "still failing", "doesn't work", "stale", "cache", "wrong branch"]
+    }
+  ]
+}
