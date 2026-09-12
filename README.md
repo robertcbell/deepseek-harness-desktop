@@ -114,44 +114,6 @@ bun run package:dmg
 bun run doctor
 ```
 
----
-
-<div dir="rtl">
-
-## 🇸🇦 دليل الاستخدام والتشغيل بالعربية
-
-### نظرة عامة
-تطبيق **DeepSeek Harness Desktop** هو تطبيق ماك أصلي (Native macOS App) مبني بلغة Swift و WebKit ليوفر تشغيلًا سلسًا وسريعًا لـ DeepSeek Harness مباشرة من الـ Dock أو مجلد Applications دون الحاجة لتشغيل سطر الأوامر يدويًا أو فتح متصفح خارجي مثل Google Chrome.
-
-### طرق التثبيت
-
-#### 1. التثبيت السريع عبر سطر الأوامر (مستحسن):
-```bash
-curl -fsSL https://raw.githubusercontent.com/imMamdouhaboammar/deepseek-harness-desktop/main/install.sh | bash
-```
-
-#### 2. التثبيت عبر npm / Bun:
-```bash
-npx deepseek-harness-macos setup --open
-```
-
-#### 3. التثبيت اليدوي من ملف الـ DMG:
-حمّل ملف `DeepSeek-Harness-macOS.dmg` من قسم [Releases](https://github.com/imMamdouhaboammar/deepseek-harness-desktop/releases)، ثم اسحب الأيقونة إلى مجلد التطبيقات `/Applications`.
-
-### أهم المزايا والتحسينات المدمجة:
-1. **التشغيل الفوري من Dock**: بنقرة واحدة يعمل التطبيق كنافذة مكتبية أصلية أنيقة دون شريط عنوان مزعج (Frameless).
-2. **سيرفر خلفي تلقائي (LaunchAgent Daemon)**: يتم تسجيل الخدمة كـ LaunchAgent يعمل تلقائيًا مع تشغيل الماك ويُعاد تشغيله في حال حدوث أي خطأ.
-3. **حل مشكلة المصادقة التلقائية (Auto-Auth Invariant)**: يحل مشكلة الرمز العشوائي (Random Token) عن طريق توليد كوكي جلسة مصرح به لـ 127.0.0.1 تلقائيًا، مما يمنع خطأ 401 نهائيًا.
-4. **أكثر من 190 وكيل ذكي مخصص (Agent Presets)**: جاهزة للاستخدام الفوري لمهام البرمجة، المعمارية، التصميم، والتحليل.
-5. **لوحة فحص شاملة للأخطاء (Doctor)**:
-```bash
-dsh-desktop doctor
-```
-يفحص البيئة، المترجم، المنافذ، السيرفر، ومطابقة الشروط بدقة.
-
-</div>
-
----
-
 ## 📄 License
+
 MIT © DeepSeek Harness Community

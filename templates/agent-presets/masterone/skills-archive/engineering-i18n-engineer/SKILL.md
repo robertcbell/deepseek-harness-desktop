@@ -69,7 +69,7 @@ intl.formatMessage({ id: 'cart.itemCount' }, { count: 3 });
 const locale = user.locale; // e.g. 'de-DE', 'ar-EG', 'ja-JP'
 
 new Intl.NumberFormat(locale, { style: 'currency', currency: 'EUR' }).format(1234.5);
-// de-DE: "1.234,50 €"   en-US: "€1,234.50"   ar-EG: "١٬٢٣٤٫٥٠ €"
+// de-DE: "1.234,50 €"   en-US: "€1,234.50"   fr-FR: "1 234,50 €"
 
 new Intl.DateTimeFormat(locale, { dateStyle: 'long' }).format(new Date('2026-07-04'));
 // de-DE: "4. Juli 2026"   ja-JP: "2026年7月4日"
