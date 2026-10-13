@@ -25,3 +25,35 @@ logs/
 
 # Agent Kernel / IDE
 .planning/
+
+# Private runtime state and local measurement evidence
+.dsh/private/
+*.credentials.*
+!templates/credentials.example.yaml
+credentials*.sh
+*.keychain.*
+.verify/
+.tools/
+.npm-cache/
+*.jsonl
+session*.zstd
+/gate8-*
+/operator-*
+/restructure-*
+/prepare-gate8-*
+/run-gate8-*
+/observe-gate8-*
+/finish-gate8-*
+/annotate-gate8-*
+/audit-gate8-*
+/manual-*-check.mjs
+/*transfer-token*
+/*token-transfer*
+/configure-airtable-token.py
+/migrate-airtable-private.mjs
+/save-transfer-token.py
+.env*
+!.env.example
+/setup-*.txt
+/timeout-diagnosis/
+/po-polling-draft.json
