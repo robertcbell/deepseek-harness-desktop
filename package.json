@@ -25,7 +25,9 @@
     "restart": "bun bin/dsh-desktop.mjs restart",
     "status": "bun bin/dsh-desktop.mjs status",
     "doctor": "bun bin/dsh-desktop.mjs doctor",
-    "open": "bun bin/dsh-desktop.mjs open"
+    "open": "bun bin/dsh-desktop.mjs open",
+    "test:gate8": "node --test tests/gate8/*.test.mjs",
+    "test:maestro": "node scripts/test-maestro-patch.mjs"
   },
   "keywords": [
     "deepseek",
@@ -61,6 +63,8 @@
     "templates",
     "install.sh",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "patches",
+    "docs"
   ]
 }

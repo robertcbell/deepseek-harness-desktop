@@ -117,3 +117,14 @@ bun run doctor
 ## 📄 License
 
 MIT © DeepSeek Harness Community
+
+## Gate 8 recovery tooling
+
+Optional Node 24 tooling packages the verified Maestro v4 compatibility patch and a time-based, PID-targeted recovery trial runner. It has no Playwright dependency and does not change the running DSH profile during installation or tests.
+
+```sh
+npm run test:gate8
+npm run test:maestro
+```
+
+See [results and limits](docs/gate8-results.md) and [patch application / reproduction](docs/gate8-reproduction.md). Local credentials, session journals, configuration snapshots, and raw trial logs remain outside Git.

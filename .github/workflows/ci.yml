@@ -28,3 +28,18 @@ jobs:
 
       - name: Run CLI Doctor
         run: bun bin/dsh-desktop.mjs doctor || true
+
+  gate8-recovery:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Portable operator tests
+        run: npm run test:gate8
+      - name: Version-pinned Maestro patch tests
+        run: npm run test:maestro
