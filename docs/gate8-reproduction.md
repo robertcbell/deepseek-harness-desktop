@@ -46,3 +46,15 @@ node scripts/run-gate8-trials.mjs --config /absolute/path/outside/git/trial.json
 The first command validates paths/config only. The armed run observes confirmed Ready → Doing, waits 90 seconds, kills exactly one verified listener, waits for automatic restart, and uses normal DSH startup only if no listener returns within 30 seconds. It polls Airtable and the expected new report every 10 seconds, stopping at five minutes after kill. A failed run writes its result and freezes only the explicitly configured fixture as Blocked; it never retries a PATCH or repairs/rearms the worker. Review ambiguous freeze responses manually.
 
 Run a separate fresh scope per trial. Resume attribution and semantic worker repair/correction counts must be audited after the result; they are not completion gates. Raw local evidence must remain outside Git. The packaged runner preserves the decision rules but was not itself subjected to another live kill test during closeout.
+
+## Publishing changes and documentation
+
+Commit reusable implementation under `scripts/`, portable tests under `tests/`, the version-pinned patch and its notices under `patches/`, and documentation under `docs/`. Keep the results summary in [gate8-results.md](gate8-results.md) explicit about synthetic data, failed attempts, and what was not tested. Documentation belongs in Git; raw trial evidence does not.
+
+The root-level setup and diagnostic helpers are local orchestration history, not the packaged runner. Their ignore rules do not exclude the portable implementations under `scripts/gate8/` or public documentation under `docs/`. Keep machine-specific skill copies and their generated reports private. If a local helper contains a reusable fix, adapt it into the portable implementation and add a focused test rather than committing the helper unchanged.
+
+Keep credentials, runtime configuration, raw session journals, Queue snapshots and identifiers, screenshots, and generated trial reports outside Git. The live runner enforces this boundary for its configuration, expected report and output directory, including symlinks. Public docs should use placeholders for private identifiers and paths; preserve exact raw evidence separately for authorized local review. Ignore rules do not sanitize files that are already tracked.
+
+Before committing, inspect the actual staged diff and file list. Stage the intended paths explicitly; avoid a blanket add of the trial workspace. Run both portable test commands above, then wait for the PR's Linux/macOS recovery tests and macOS app-build check. A green portable suite does not replace a live interruption trial, and a successful synthetic trial does not establish reboot, laptop pairing, or production readiness.
+
+After merging, fetch the publication remote and fast-forward the corresponding local branch. A checkout tracking a different remote or an older commit can still look incomplete after its PR has merged; confirm the PR's merged state and the publication branch independently of local trial files.
