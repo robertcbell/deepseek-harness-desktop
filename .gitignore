@@ -57,3 +57,24 @@ session*.zstd
 /setup-*.txt
 /timeout-diagnosis/
 /po-polling-draft.json
+
+# Machine-specific Gate 8 setup and diagnostic helpers (portable versions live in scripts/)
+/local-trial-artifacts/
+/activate-readonly-proof.mjs
+/cleanup-gate8-*.mjs
+/deploy-gate8-*.mjs
+/deploy-po-artifact-contract.mjs
+/install-gate8*.mjs
+/install-jev-shadow.mjs
+/install-minimal-daemon.mjs
+/install-readonly-cron.mjs
+/maestro-v4-compat.test.mjs
+/preflight-gate8-*.mjs
+/queue-readonly-probe.mjs
+/repair-jev-test-session.mjs
+/scope-gate8.mjs
+/start-gate8-*.mjs
+/test-native-autoresume-manual.mjs
+/verify-gate8-*.mjs
+/verify-restructure-*.mjs
+/po-matching/
