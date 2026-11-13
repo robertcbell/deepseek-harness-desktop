@@ -78,3 +78,6 @@ session*.zstd
 /verify-gate8-*.mjs
 /verify-restructure-*.mjs
 /po-matching/
+
+# Local Git worktrees
+.worktrees/
