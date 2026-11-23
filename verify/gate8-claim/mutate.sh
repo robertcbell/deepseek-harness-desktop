@@ -43,7 +43,7 @@ open(f,'w').write(s)
 NO_MARK="sub('''  mark(fields) {
 ''', '''  mark(fields) { return;
 ''')"
-mutant M1-no-lock claim-x2 "sub('''   try { fs.linkSync(tmp, lockPath); return true; }''', '''   try { fs.rmSync(tmp, { force: true }); return true; }''')
+mutant M1-no-lock claim-x2 "sub('''   try { fs.linkSync(tmp, lockPath); }''', '''   try { fs.rmSync(tmp, { force: true }); return true; }''')
 $NO_MARK"
 
 # M2: lock kept, Ready/unclaimed check removed: a later claimer overwrites the owner.
@@ -80,25 +80,19 @@ mutant M6-timeout-as-definite claim-x2-delayed "sub('''export const definitePatc
 mutant M7-keep-on-definite claim-x2-faults "sub('''   if (definitePatchFailure(e)) throw e;
    keep = true;''', '''   keep = true;''')"
 
-# M8: clear-ambiguous without the quiescence window (= the old advice:
-# remove the lock once no claimer is running). A delayed PATCH lands after the
-# clear and overwrites the next claimer (the reviewer's loopback reproduction).
-mutant M8-clear-no-window claim-x2-clear "sub('''  if (n1 - start < quiescenceMs) return''', '''  if (false) return''')
-sub('''  if (n2 - start < quiescenceMs) return''', '''  if (false) return''')"
+# M8: clear regardless of the record (= --force-accept-risk on every clear,
+# and the old "delete the lock" advice). A delayed PATCH lands after the clear
+# and overwrites the next claimer (the reviewer's loopback reproduction).
+mutant M8-clear-always claim-x2-clear "sub('''export async function clearAmbiguousLock({ lock, item, get, forceAcceptRisk = false,''', '''export async function clearAmbiguousLock({ lock, item, get, forceAcceptRisk = true,''')"
 
-# M9: clear-ambiguous without the second (settle) read. EQUIVALENT under the
-# explorer's timing assumption (no PATCH is in flight once the window has
-# passed), so it is expected to survive. The double read is defence in depth
-# for a store that breaks that assumption; tests/gate8/claim.test.mjs covers
-# it directly ("a PATCH landing between the two settle reads is detected").
-mutant M9-clear-single-read claim-x2-clear "sub('''  await pause(settleMs);
-  const r2 = await get(); const n2 = serverTime(r2);''', '''  const r2 = r1; const n2 = n1;''')" survives
+# M9: clear exactly when the record does NOT show the recorded PATCH values
+# (inverted match): the PATCH outcome is unknown, it lands later and
+# overwrites the next claimer.
+mutant M9-clear-on-mismatch claim-x2-clear "sub('''   if (record && recordShows(record.fields, h.expect)) {''', '''   if (record && !recordShows(record.fields, h.expect)) {''')"
 
-# M10: measure the clear window on the LOCAL clock (= 0ad0135, review
-# blocker "clock-forward"): a forward local-clock jump opens the window while
-# A's PATCH is still in flight.
-mutant M10-clear-local-clock claim-x2-clear "sub('''  const r1 = await get(); const n1 = serverTime(r1);''', '''  const r1 = await get(); const n1 = lock.now();''')
-sub('''  const r2 = await get(); const n2 = serverTime(r2);''', '''  const r2 = await get(); const n2 = lock.now();''')"
+# M10: treat every current-format lock as "no PATCH sent", skipping the
+# record check even after a PATCH was recorded.
+mutant M10-ignore-recorded-patch claim-x2-clear "sub('''  if (current && h.state === 'claiming') {''', '''  if (current) {''')"
 
 echo "### baseline (unmutated scripts/gate8/claim.mjs)"
 node "$here/explore.mjs" --lib "$root/scripts/gate8"; rc=$?

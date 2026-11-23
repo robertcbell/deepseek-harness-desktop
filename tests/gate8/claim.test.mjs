@@ -6,15 +6,16 @@ import path from 'node:path';
 import http from 'node:http';
 import {spawn} from 'node:child_process';
 import {fileURLToPath, pathToFileURL} from 'node:url';
-import {claimItem, fileClaimLock, clearAmbiguousLock, CLEAR_QUIESCENCE_MS} from '../../scripts/gate8/claim.mjs';
+import {claimItem, fileClaimLock, clearAmbiguousLock, LOCK_FORMAT} from '../../scripts/gate8/claim.mjs';
+import {createAirtableApi} from '../../scripts/gate8/airtable-api.mjs';
 
 const claimUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../scripts/gate8/claim.mjs')).href;
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'gate8-claim-test-'));
-// A Queue read as scripts/gate8/airtable-api.mjs returns it: the record plus
-// serverDate, the HTTP Date header (1 s resolution) of a virtual SERVER clock.
 const T0 = Date.parse('2026-11-22T10:00:00Z');
-const at = (fields, t = T0) => ({fields: {...fields}, serverDate: new Date(t).toUTCString()});
-const stamped = (record, srv = {t: T0}) => ({...structuredClone(record), serverDate: new Date(srv.t).toUTCString()});
+// A Queue read. The clock-free clear ignores any Date header, so reads carry
+// none here (the attack tests below send hostile ones over HTTP).
+const at = fields => ({fields: {...fields}});
+const stamped = record => structuredClone(record);
 
 // Fake Queue: a local HTTP server holding one record (last-writer-wins PATCH,
 // like Airtable). With `script` ([[who, method], ...]) it answers requests
@@ -41,7 +42,7 @@ const child = `
 import fs from 'node:fs';
 import {claimItem,fileClaimLock} from ${JSON.stringify(claimUrl)};
 const [base,lockPath,barrier,owner,useLock,who]=process.argv.slice(1);
-const api=async(method,fields)=>{const r=await fetch(base+'/'+who,{method,headers:{'Content-Type':'application/json'},body:fields?JSON.stringify({fields}):undefined});return {...await r.json(),serverDate:r.headers.get('date')};};
+const api=async(method,fields)=>{const r=await fetch(base+'/'+who,{method,headers:{'Content-Type':'application/json'},body:fields?JSON.stringify({fields}):undefined});return r.json();};
 const noLock={acquire:()=>true,release(){},holder:()=>null};
 fs.writeFileSync(barrier+'.'+owner,'');while(fs.readdirSync(fs.realpathSync(barrier+'/..')).filter(n=>n.startsWith('go.')).length<2){await new Promise(r=>setTimeout(r,1));}
 const slow=ms=>new Promise(r=>setTimeout(r,ms));
@@ -159,6 +160,11 @@ test('review blocker 2: ENOSPC while writing lock metadata leaves no lock and no
 });
 
 // ---- clear-ambiguous: the only supported way to clear an ambiguous lock ----
+//
+// Clock-free rule: the lock durably records the exact PATCH fields and the
+// record values that prove the PATCH applied (`expect`, incl. the claim id
+// `Claimed At`). The clear succeeds only when the record shows `expect`;
+// otherwise it refuses, unless --force-accept-risk (removes with a warning).
 
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -168,216 +174,176 @@ test('the needs-operator and skip messages point to `gate8-queue.mjs clear-ambig
   const a = await claimItem({owner: 'A', item: 'recFIXTURE', lock: fileClaimLock(lockPath), get: async () => ready(), patch: async () => { throw timeoutError(); }, save() {}});
   assert.equal(a.action, 'needs-operator'); assert.equal(a.clearCommand, 'node gate8-queue.mjs clear-ambiguous recFIXTURE');
   const h = fileClaimLock(lockPath).holder();
-  assert.equal(h.state, 'ambiguous'); assert.equal(h.item, 'recFIXTURE'); assert.equal(h.step, 'owner');
-  assert.ok(Number.isFinite(Date.parse(h.patchStartedAt)), 'lock records when the ambiguous PATCH started');
+  assert.equal(h.state, 'ambiguous'); assert.equal(h.item, 'recFIXTURE'); assert.equal(h.step, 'owner'); assert.equal(h.format, LOCK_FORMAT);
   const b = await claimItem({owner: 'B', item: 'recFIXTURE', lock: fileClaimLock(lockPath), get: async () => assert.fail(), patch: async () => assert.fail(), save() {}});
   for (const m of [a.message, b.message]) { assert.match(m, new RegExp(esc('gate8-queue.mjs clear-ambiguous recFIXTURE'))); assert.match(m, /Do not delete/); assert.doesNotMatch(m, /remove .*manually/); }
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('acquiredServerAt and patchServerStart (Date of the GET just before each PATCH) are written BEFORE the PATCH is sent', async () => {
+test('the lock records the exact PATCH fields and the expected record values (owner + claim id) before each PATCH is sent', async () => {
  const dir = tmp(); const lockPath = path.join(dir, 'l');
  try {
-  const seen = [];
-  // The server clock reads 10:00:00 before the owner PATCH and 10:00:07 before the Doing PATCH.
-  const times = [T0, T0 + 7000]; let n = 0;
-  await claimItem({owner: 'o', lock: fileClaimLock(lockPath), get: async () => at({Status: 'Ready', 'Claimed By': n ? 'o' : ''}, times[n++]),
-   patch: async f => { seen.push(fileClaimLock(lockPath).holder()); return {}; }, save() {}});
-  assert.deepEqual(seen.map(h => [h.state, h.step, typeof h.patchStartedAt, h.patchServerStart, h.acquiredServerAt]),
-   [['patching', 'owner', 'string', '2026-11-22T10:00:00.000Z', '2026-11-22T10:00:00.000Z'], ['patching', 'doing', 'string', '2026-11-22T10:00:07.000Z', '2026-11-22T10:00:00.000Z']]);
+  const seen = []; let n = 0; const sent = [];
+  await claimItem({owner: 'o', lock: fileClaimLock(lockPath, {now: () => T0 + 1234}), get: async () => at({Status: 'Ready', 'Claimed By': n++ ? 'o' : ''}),
+   patch: async f => { sent.push(f); seen.push(fileClaimLock(lockPath).holder()); return {}; }, save() {}});
+  const claimId = new Date(T0 + 1000).toISOString();
+  assert.deepEqual(sent, [{'Claimed By': 'o', 'Claimed At': claimId}, {Status: 'Doing'}]);
+  assert.deepEqual(seen.map(h => [h.state, h.step, h.patch, h.expect]), [
+   ['patching', 'owner', sent[0], {'Claimed By': 'o', 'Claimed At': claimId}],
+   ['patching', 'doing', sent[1], {Status: 'Doing', 'Claimed By': 'o', 'Claimed At': claimId}]]);
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('a read without a parseable Date header stops the claim before any PATCH and releases the lock', async () => {
+test('fsync: the lock file and its directory are fsynced before the PATCH is sent (fs stubbed, calls counted)', async () => {
  const dir = tmp(); const lockPath = path.join(dir, 'l');
+ const orig = {fsyncSync: fs.fsyncSync, fdatasyncSync: fs.fdatasyncSync, openSync: fs.openSync, closeSync: fs.closeSync};
+ const ops = []; const dirFds = new Set(); let fileSyncs = 0, dirSyncs = 0;
  try {
-  for (const serverDate of [undefined, 'not a date']) {
-   await assert.rejects(claimItem({owner: 'o', lock: fileClaimLock(lockPath), get: async () => ({fields: {Status: 'Ready', 'Claimed By': ''}, serverDate}),
-    patch: async () => assert.fail('no PATCH without a server time'), save: () => assert.fail()}), {code: 'ENOSERVERTIME'});
-   assert.equal(fs.existsSync(lockPath), false);
-  }
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+  fs.openSync = (p, ...rest) => { const fd = orig.openSync(p, ...rest); if (path.resolve(String(p)) === dir) dirFds.add(fd); return fd; };
+  fs.closeSync = fd => { dirFds.delete(fd); return orig.closeSync(fd); };
+  fs.fsyncSync = fd => { if (dirFds.has(fd)) { dirSyncs++; ops.push('fsync-dir'); } else { fileSyncs++; ops.push('fsync-file'); } return orig.fsyncSync(fd); };
+  let n = 0; const atPatch = [];
+  const out = await claimItem({owner: 'A', lock: fileClaimLock(lockPath), get: async () => at({Status: 'Ready', 'Claimed By': n++ ? 'A' : ''}),
+   patch: async f => { atPatch.push({fileSyncs, dirSyncs, holder: JSON.parse(fs.readFileSync(lockPath, 'utf8'))}); ops.push('PATCH'); return {}; }, save() {}});
+  assert.equal(out.action, 'claimed');
+  // acquire (file + dir) and the owner-step mark (file + dir) precede the first PATCH.
+  assert.ok(atPatch[0].fileSyncs >= 2 && atPatch[0].dirSyncs >= 2, JSON.stringify(atPatch[0]));
+  assert.ok(atPatch[1].fileSyncs >= atPatch[0].fileSyncs + 1 && atPatch[1].dirSyncs >= atPatch[0].dirSyncs + 1, 'the Doing-step record is fsynced before the Doing PATCH');
+  assert.deepEqual(atPatch.map(p => p.holder.step), ['owner', 'doing']);
+  // Each PATCH is immediately preceded by fsync of the file and then the directory.
+  for (const i of ops.flatMap((o, k) => o === 'PATCH' ? [k] : [])) assert.deepEqual(ops.slice(i - 2, i), ['fsync-file', 'fsync-dir']);
+ } finally { Object.assign(fs, orig); fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-// Virtual SERVER clock (clock: the Date header of every read) and an
-// independent virtual LOCAL clock (local: the lock's now()), shared
-// last-writer-wins record. A's owner PATCH times out and is still in flight.
-async function ambiguousA(dir, clock, local = {t: clock.t}) {
+// A's owner PATCH times out and is still in flight; shared last-writer-wins record.
+async function ambiguousA(dir, local = {t: T0}) {
  const lockPath = path.join(dir, 'gate8-claim.lock');
  const record = ready(); let delayed = null;
  const lock = () => fileClaimLock(lockPath, {now: () => local.t});
- const get = async () => stamped(record, clock);
+ const get = async () => stamped(record);
  const a = await claimItem({owner: 'A', item: 'rec1', lock: lock(), get, patch: async f => { delayed = () => Object.assign(record.fields, f); throw timeoutError(); }, save: () => assert.fail()});
  assert.equal(a.action, 'needs-operator');
  return {lockPath, record, lock, get, delayed: () => delayed()};
 }
 
-test('clear-ambiguous before the quiescence window (server clock) is refused and keeps the lock', async () => {
- const dir = tmp(); const clock = {t: T0};
+test('the PATCH has not applied: clear-ambiguous refuses, keeps the lock and explains the options; B cannot claim; A\'s late PATCH overwrites nobody', async () => {
+ const dir = tmp();
  try {
-  const s = await ambiguousA(dir, clock);
-  for (const dt of [0, 60_000, CLEAR_QUIESCENCE_MS - 1000]) {
-   clock.t = T0 + dt;
-   const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => assert.fail('no settle pause inside the window')});
-   assert.equal(out.action, 'refused'); assert.equal(out.reason, 'quiescence-window'); assert.equal(out.waitMs, CLEAR_QUIESCENCE_MS - dt);
+  const s = await ambiguousA(dir);
+  for (let i = 0; i < 3; i++) {
+   const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get});
+   assert.equal(out.action, 'refused'); assert.equal(out.reason, 'patch-outcome-unknown');
+   assert.match(out.message, /may still apply/); assert.match(out.message, /rerun/); assert.match(out.message, /--force-accept-risk/);
    assert.equal(fs.existsSync(s.lockPath), true);
   }
-  assert.ok(CLEAR_QUIESCENCE_MS >= 10 * 60 * 1000, 'window is at least 10 minutes');
-  // The window must hold on the second read too (server clock read twice).
-  clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const back = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => { clock.t = T0 + 60_000; }});
-  assert.equal(back.reason, 'quiescence-window'); assert.equal(fs.existsSync(s.lockPath), true);
-  // A clear for another item is refused too.
-  const wrong = await clearAmbiguousLock({lock: s.lock(), item: 'recOTHER', get: async () => assert.fail(), pause: async () => {}});
+  const b = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async () => assert.fail(), save: () => assert.fail()});
+  assert.equal(b.reason, 'claim-lock-held');
+  s.delayed(); assert.equal(s.record.fields['Claimed By'], 'A');
+  // Wrong item: refused before any read.
+  const wrong = await clearAmbiguousLock({lock: s.lock(), item: 'recOTHER', get: async () => assert.fail()});
   assert.equal(wrong.reason, 'wrong-item'); assert.equal(fs.existsSync(s.lockPath), true);
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('clear-ambiguous refuses when either read lacks a parseable Date header', async () => {
- const dir = tmp(); const clock = {t: T0};
+test('a landed PATCH is accepted as A\'s claim: the clear reports A as owner and removes the lock; B then skips the owned record', async () => {
+ const dir = tmp();
  try {
-  const s = await ambiguousA(dir, clock);
-  clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  for (const bad of [[undefined, 0], ['garbage', 0], [undefined, 1], ['garbage', 1]]) {
-   let n = 0;
-   const get = async () => { const r = await s.get(); if (n++ === bad[1]) { if (bad[0] === undefined) delete r.serverDate; else r.serverDate = bad[0]; } return r; };
-   const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get, pause: async () => {}});
-   assert.equal(out.reason, 'no-server-time', JSON.stringify(bad)); assert.equal(fs.existsSync(s.lockPath), true);
-  }
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('review blocker 3a (attack old-format-crash): a legacy lock without patchServerStart is refused, never cleared by its local acquisition time', async () => {
- const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
- try {
-  const record = ready(); const clock = {t: T0 + CLEAR_QUIESCENCE_MS};
-  const get = async () => stamped(record, clock);
-  // Exact c03cf0a acquisition metadata left by a crash during its PATCH (acquired at T0, PATCH sent ~40 s later).
-  const legacy = [{owner: 'A', pid: 2147483647, at: new Date(T0).toISOString(), state: 'claiming'},
-   {owner: 'A', pid: 2147483647, item: 'rec1', at: new Date(T0).toISOString(), state: 'patching', step: 'owner', patchStartedAt: new Date(T0).toISOString()},
-   {owner: 'A', pid: 2147483647, item: 'rec1', at: new Date(T0).toISOString(), state: 'ambiguous', step: 'owner', patchStartedAt: new Date(T0).toISOString(), ambiguousAt: new Date(T0).toISOString()},
-   {owner: 'A', pid: 2147483647, item: 'rec1', state: 'ambiguous', step: 'owner', patchServerStart: 'not a date'}];
-  for (const h of legacy) {
-   fs.writeFileSync(lockPath, JSON.stringify(h));
-   for (const dt of [CLEAR_QUIESCENCE_MS, 7 * 86_400_000]) {
-    clock.t = T0 + dt;
-    const out = await clearAmbiguousLock({lock: fileClaimLock(lockPath), item: 'rec1', get: async () => assert.fail('refused before any read'), pause: async () => {}, isAlive: () => false});
-    assert.equal(out.action, 'refused'); assert.equal(out.reason, 'no-server-time-in-lock', JSON.stringify(h));
-    assert.match(out.message, /server-clock/); assert.match(out.message, /lock is kept/);
-    assert.equal(fs.readFileSync(lockPath, 'utf8'), JSON.stringify(h));
-   }
-  }
-  // B keeps skipping, so A's late PATCH cannot overwrite a later owner.
-  const b = await claimItem({owner: 'B', item: 'rec1', lock: fileClaimLock(lockPath), get, patch: async () => assert.fail(), save: () => assert.fail()});
-  assert.equal(b.reason, 'claim-lock-held');
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('review blocker 3b (attack clock-forward): a forward jump of the LOCAL clock does not open the window', async () => {
- const dir = tmp(); const clock = {t: T0}; const local = {t: T0};
- try {
-  const s = await ambiguousA(dir, clock, local);
-  // Right after the timeout the local clock jumps forward 10 min (and a day); Airtable's clock moved 1 s.
-  for (const jump of [CLEAR_QUIESCENCE_MS, 86_400_000]) {
-   local.t = T0 + jump; clock.t = T0 + 1000;
-   const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}});
-   assert.equal(out.action, 'refused'); assert.equal(out.reason, 'quiescence-window'); assert.equal(out.waitMs, CLEAR_QUIESCENCE_MS - 1000);
-   assert.equal(fs.existsSync(s.lockPath), true);
-  }
-  const b = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async f => Object.assign(s.record.fields, f), save: () => assert.fail()});
-  assert.equal(b.reason, 'claim-lock-held');
-  s.delayed(); assert.equal(s.record.fields['Claimed By'], 'A');
-  // A backward local jump does not shorten or block it either: only the server clock counts.
-  local.t = T0 - 86_400_000; clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const ok = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}});
-  assert.equal(ok.action, 'cleared'); assert.equal(ok.patchLanded, true);
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('a delayed PATCH landing within the window is blocked (refused) and then reported as landed; the next claimer cannot be overwritten', async () => {
- const dir = tmp(); const clock = {t: T0};
- try {
-  const s = await ambiguousA(dir, clock);
-  clock.t = T0 + 30_000;
-  assert.equal((await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}})).reason, 'quiescence-window');
-  const b1 = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async () => assert.fail(), save: () => assert.fail()});
-  assert.equal(b1.reason, 'claim-lock-held');
-  s.delayed(); // A's PATCH lands inside the window
-  clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}});
-  assert.equal(out.action, 'cleared'); assert.equal(out.patchLanded, true); assert.equal(out.record['Claimed By'], 'A');
-  assert.match(out.message, /landed/); assert.equal(fs.existsSync(s.lockPath), false);
-  const b2 = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async () => assert.fail('B must not PATCH an owned record'), save: () => assert.fail()});
-  assert.equal(b2.action, 'skip'); assert.equal(b2.claimed, true); assert.equal(s.record.fields['Claimed By'], 'A');
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('a PATCH landing between the two settle reads is detected: clear refused, lock kept', async () => {
- const dir = tmp(); const clock = {t: T0};
- try {
-  const s = await ambiguousA(dir, clock);
-  clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const pauses = [];
-  const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async ms => { pauses.push(ms); clock.t += ms; s.delayed(); }});
-  assert.equal(out.action, 'refused'); assert.equal(out.reason, 'record-changing'); assert.ok(pauses[0] >= 1000, 'reads are seconds apart');
-  assert.equal(fs.existsSync(s.lockPath), true);
-  const again = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}});
-  assert.equal(again.action, 'cleared'); assert.equal(again.patchLanded, true);
- } finally { fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('clear-ambiguous after the window succeeds and reports a PATCH that did not land; the next claimer then claims', async () => {
- const dir = tmp(); const clock = {t: T0};
- try {
-  const s = await ambiguousA(dir, clock);
-  clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, pause: async () => {}});
-  assert.equal(out.action, 'cleared'); assert.equal(out.patchLanded, false); assert.match(out.message, /did not land/);
+  const s = await ambiguousA(dir);
+  s.delayed(); // A's PATCH lands at any time; no waiting needed
+  const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get});
+  assert.equal(out.action, 'cleared'); assert.equal(out.outcome, 'patch-applied'); assert.equal(out.owner, 'A');
+  assert.equal(out.record['Claimed By'], 'A'); assert.match(out.message, /has applied/);
   assert.deepEqual(fs.readdirSync(dir), [], 'lock and clear mutex removed');
-  const b = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async f => Object.assign(s.record.fields, f), save() {}});
-  assert.equal(b.action, 'claimed'); assert.equal(s.record.fields['Claimed By'], 'B');
+  const b = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async () => assert.fail('B must not PATCH an owned record'), save: () => assert.fail()});
+  assert.equal(b.action, 'skip'); assert.equal(b.claimed, true); assert.equal(s.record.fields['Claimed By'], 'A');
   assert.equal((await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get})).action, 'no-lock');
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('a claiming-state lock (no PATCH recorded) is cleared only after the window from acquiredServerAt AND while both reads still show Ready/unclaimed', async () => {
- const dir = tmp(); const lockPath = path.join(dir, 'l');
+test('match is exact: another owner, another claim id, or a Doing step whose Status PATCH has not applied are all refused', async () => {
+ const dir = tmp();
  try {
-  const lock = fileClaimLock(lockPath);
-  const h = {item: 'rec1', acquiredServerAt: new Date(T0).toISOString()};
-  assert.equal(lock.acquire('live', h), true);
-  const out = await clearAmbiguousLock({lock, item: 'rec1', get: async () => assert.fail(), pause: async () => {}});
-  assert.equal(out.reason, 'claimer-running', 'a live claimer is never cleared'); assert.equal(fs.existsSync(lockPath), true);
-  const dead = {lock, item: 'rec1', pause: async () => {}, isAlive: () => false};
-  // Inside the window by the server clock: refused.
-  assert.equal((await clearAmbiguousLock({...dead, get: async () => at({Status: 'Ready', 'Claimed By': ''}, T0 + CLEAR_QUIESCENCE_MS - 1000)})).reason, 'quiescence-window');
-  // Past the window but the record is no longer pre-claim (claimed, or Doing): refused.
-  for (const f of [{Status: 'Ready', 'Claimed By': 'live'}, {Status: 'Doing', 'Claimed By': ''}])
-   assert.equal((await clearAmbiguousLock({...dead, get: async () => at(f, T0 + CLEAR_QUIESCENCE_MS)})).reason, 'not-pre-claim');
-  // Past the window and still Ready/unclaimed in both reads: cleared.
-  const ok = await clearAmbiguousLock({...dead, get: async () => at({Status: 'Ready', 'Claimed By': ''}, T0 + CLEAR_QUIESCENCE_MS)});
-  assert.equal(ok.action, 'cleared'); assert.equal(ok.patchLanded, false);
-  // Without acquiredServerAt: refused with an explanation, never cleared.
-  assert.equal(lock.acquire('old', {item: 'rec1'}), true);
-  const legacy = await clearAmbiguousLock({...dead, get: async () => assert.fail('refused before any read')});
-  assert.equal(legacy.reason, 'no-server-time-in-lock'); assert.match(legacy.message, /acquiredServerAt/); assert.equal(fs.existsSync(lockPath), true);
-  // Concurrent clears are serialized.
-  fs.writeFileSync(lockPath + '.clear', '{}');
-  assert.equal((await clearAmbiguousLock({...dead, get: async () => assert.fail()})).reason, 'clear-in-progress');
-  assert.equal(fs.existsSync(lockPath), true);
+  const s = await ambiguousA(dir);
+  const claimId = fileClaimLock(s.lockPath).holder().expect['Claimed At'];
+  for (const f of [{'Claimed By': 'B', 'Claimed At': claimId}, {'Claimed By': 'A', 'Claimed At': '2026-11-22T09:59:59.000Z'}, {'Claimed By': 'A'}]) {
+   const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: async () => at({Status: 'Ready', ...f})});
+   assert.equal(out.reason, 'patch-outcome-unknown', JSON.stringify(f)); assert.equal(fs.existsSync(s.lockPath), true);
+  }
+  // Airtable's normalized datetime form of the same instant is accepted.
+  const ok = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: async () => at({Status: 'Ready', 'Claimed By': 'A', 'Claimed At': claimId.replace('.000Z', 'Z')})});
+  assert.equal(ok.outcome, 'patch-applied');
+  // Doing step ambiguous: the owner PATCH applied, the Status PATCH may still be pending.
+  const record = ready(); let n = 0; const lockPath = path.join(dir, 'd.lock');
+  const d = await claimItem({owner: 'A', item: 'rec1', lock: fileClaimLock(lockPath), get: async () => stamped(record),
+   patch: async f => { if (n++) throw timeoutError(); Object.assign(record.fields, f); return {}; }, save: () => assert.fail()});
+  assert.equal(d.action, 'needs-operator');
+  const no = await clearAmbiguousLock({lock: fileClaimLock(lockPath), item: 'rec1', get: async () => stamped(record)});
+  assert.equal(no.reason, 'patch-outcome-unknown'); assert.equal(fs.existsSync(lockPath), true);
+  record.fields.Status = 'Doing';
+  assert.equal((await clearAmbiguousLock({lock: fileClaimLock(lockPath), item: 'rec1', get: async () => stamped(record)})).outcome, 'patch-applied');
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-// Loopback fake Airtable: real HTTP, last-writer-wins, A's first owner PATCH
-// is held (heldPatch() applies it later), and every response carries a Date
-// header from a virtual SERVER clock. api() has scripts/gate8/airtable-api.mjs's
-// shape: fetch with AbortSignal.timeout, serverDate from the Date header.
+test('--force-accept-risk removes the lock and logs an explicit warning; without it the same lock is refused', async () => {
+ const dir = tmp();
+ try {
+  const s = await ambiguousA(dir);
+  assert.equal((await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get})).action, 'refused');
+  const warnings = [];
+  const out = await clearAmbiguousLock({lock: s.lock(), item: 'rec1', get: s.get, forceAcceptRisk: true, warn: m => warnings.push(m)});
+  assert.equal(out.action, 'force-cleared'); assert.equal(out.reason, 'patch-outcome-unknown');
+  assert.equal(warnings.length, 1); assert.match(warnings[0], /^WARNING: --force-accept-risk/); assert.match(warnings[0], /overwrite a later claimer/);
+  assert.equal(out.warning, warnings[0]); assert.equal(fs.existsSync(s.lockPath), false);
+  // The documented risk is real: B claims, then A's late PATCH overwrites B.
+  const b = await claimItem({owner: 'B', item: 'rec1', lock: s.lock(), get: s.get, patch: async f => Object.assign(s.record.fields, f), save() {}});
+  assert.equal(b.action, 'claimed'); s.delayed(); assert.equal(s.record.fields['Claimed By'], 'A');
+ } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('legacy locks without recorded PATCH values are refused (even years later); only --force-accept-risk removes them', async () => {
+ const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
+ try {
+  const legacy = [{owner: 'A', pid: 2147483647, at: new Date(T0).toISOString(), state: 'claiming'},
+   {owner: 'A', pid: 2147483647, item: 'rec1', state: 'patching', step: 'owner', patchStartedAt: new Date(T0).toISOString()},
+   {owner: 'A', pid: 2147483647, item: 'rec1', state: 'ambiguous', step: 'owner', patchServerStart: new Date(T0).toISOString(), acquiredServerAt: new Date(T0).toISOString()},
+   {owner: 'A', pid: 2147483647, item: 'rec1', format: LOCK_FORMAT, state: 'ambiguous', step: 'owner'}];
+  for (const h of legacy) {
+   fs.writeFileSync(lockPath, JSON.stringify(h));
+   const out = await clearAmbiguousLock({lock: fileClaimLock(lockPath), item: 'rec1', get: async () => assert.fail('refused before any read'), isAlive: () => false});
+   assert.equal(out.action, 'refused'); assert.equal(out.reason, 'legacy-lock', JSON.stringify(h)); assert.match(out.message, /--force-accept-risk/);
+   assert.equal(fs.readFileSync(lockPath, 'utf8'), JSON.stringify(h));
+   const warnings = [];
+   const forced = await clearAmbiguousLock({lock: fileClaimLock(lockPath), item: 'rec1', get: async () => assert.fail(), isAlive: () => false, forceAcceptRisk: true, warn: m => warnings.push(m)});
+   assert.equal(forced.action, 'force-cleared'); assert.equal(warnings.length, 1); assert.equal(fs.existsSync(lockPath), false);
+  }
+ } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('a current-format claiming lock of a dead claimer (no PATCH recorded, hence none sent) is cleared; a live claimer never is; clears are serialized', async () => {
+ const dir = tmp(); const lockPath = path.join(dir, 'l');
+ try {
+  const lock = fileClaimLock(lockPath);
+  assert.equal(lock.acquire('live', {item: 'rec1'}), true);
+  const out = await clearAmbiguousLock({lock, item: 'rec1', get: async () => assert.fail()});
+  assert.equal(out.reason, 'claimer-running'); assert.equal(fs.existsSync(lockPath), true);
+  fs.writeFileSync(lockPath + '.clear', '{}');
+  assert.equal((await clearAmbiguousLock({lock, item: 'rec1', get: async () => assert.fail(), isAlive: () => false})).reason, 'clear-in-progress');
+  fs.rmSync(lockPath + '.clear');
+  const ok = await clearAmbiguousLock({lock, item: 'rec1', get: async () => assert.fail('no read needed'), isAlive: () => false});
+  assert.equal(ok.action, 'cleared'); assert.equal(ok.outcome, 'no-patch-sent'); assert.deepEqual(fs.readdirSync(dir), []);
+ } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+// Loopback fake Airtable through the real scripts/gate8/airtable-api.mjs:
+// real HTTP, last-writer-wins, A's first owner PATCH is held (heldPatch()
+// applies it later). Every response carries the Date header q.date (hostile
+// values in the attack tests) and the lock's local clock is q.local.
 async function loopbackQueue() {
- const record = {id: 'rec1', fields: {Status: 'Ready', 'Claimed By': ''}}; const q = {record, clock: {t: T0}, heldPatch: null};
+ const record = {id: 'rec1', fields: {Status: 'Ready', 'Claimed By': ''}}; const q = {record, date: new Date(T0).toUTCString(), local: {t: T0}, heldPatch: null};
  const server = http.createServer((req, res) => {
   let body = ''; req.on('data', c => body += c); req.on('end', () => {
    const who = req.url.split('/')[1];
-   res.setHeader('Date', new Date(q.clock.t).toUTCString());
+   res.setHeader('Date', typeof q.date === 'function' ? q.date() : q.date);
    if (req.method === 'PATCH' && who === 'A' && !q.heldPatch) { q.heldPatch = () => { Object.assign(record.fields, JSON.parse(body).fields); try { res.end(JSON.stringify(record)); } catch {} }; return; }
    if (req.method === 'PATCH') Object.assign(record.fields, JSON.parse(body).fields);
    res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(record));
@@ -385,47 +351,43 @@ async function loopbackQueue() {
  });
  await new Promise(r => server.listen(0, '127.0.0.1', r));
  const base = `http://127.0.0.1:${server.address().port}`;
- q.api = who => async (method, fields) => { const r = await fetch(`${base}/${who}`, {method, headers: {'Content-Type': 'application/json'}, body: fields ? JSON.stringify({fields}) : undefined, signal: AbortSignal.timeout(300)});
-  if (!r.ok) throw Object.assign(Error(`HTTP ${r.status}`), {httpStatus: r.status}); return {...await r.json(), serverDate: r.headers.get('date')}; };
+ q.side = (lockPath, who) => { const api = createAirtableApi({base: `${base}/${who}`, token: 'FAKE', deadlineMs: 200, pause: async () => {}});
+  return {item: 'rec1', lock: fileClaimLock(lockPath, {now: () => q.local.t}), get: () => api('GET'), patch: f => api('PATCH', '', {fields: f})}; };
  q.close = async () => { server.closeAllConnections(); await new Promise(r => server.close(r)); };
  return q;
 }
 
-test('loopback: A times out, a clear inside the window is refused, A\'s delayed PATCH lands, B never claims over it', async () => {
- const q = await loopbackQueue();
- const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
- const side = who => ({item: 'rec1', lock: fileClaimLock(lockPath), get: () => q.api(who)('GET'), patch: f => q.api(who)('PATCH', f)});
+// The reviewer's attacks (/tmp/gate8-review-befa310.*/attack.mjs,
+// /tmp/gate8-review-0ad0135.*/attack.mjs). Each sets the Date header seen
+// during A's claim (`pre`) and during the clear (`post`) so that a window
+// measured on Date headers is "over" although A's PATCH is ~1 s old and
+// still in flight; `local` moves the lock's local clock instead. All fail on
+// befa310 except the local-clock jump, which fails on 0ad0135.
+const httpDate = t => new Date(t).toUTCString();
+const tenMin = 10 * 60_000;
+for (const [name, pre, post, local] of [
+ ['stale Date header (proxy cache 10 min old at the PATCH)', httpDate(T0 - tenMin), httpDate(T0 + 1000)],
+ ['invalid Date header "0" at the PATCH', '0', httpDate(T0 + 1000)],
+ ['Date header going backwards between the clear reads', httpDate(T0), (() => { let n = 0; return () => httpDate(T0 + tenMin + (n++ ? 10_000 : 20_000)); })()],
+ ['local clock jumps forward 10 min', httpDate(T0), httpDate(T0 + 1000), T0 + tenMin],
+]) test(`loopback attack (${name}): A's PATCH has not applied, so the clear refuses and B never gets overwritten`, async () => {
+ const q = await loopbackQueue(); const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
  try {
-  const a = await claimItem({owner: 'A', ...side('A'), save: () => assert.fail()});
+  q.date = pre;
+  const a = await claimItem({owner: 'A', ...q.side(lockPath, 'A'), save: () => assert.fail()});
   assert.equal(a.action, 'needs-operator');
-  const early = await clearAmbiguousLock({...side('op'), pause: async () => {}});
-  assert.equal(early.reason, 'quiescence-window'); assert.equal(fs.existsSync(lockPath), true);
-  const b = await claimItem({owner: 'B', ...side('B'), save: () => assert.fail()});
-  assert.equal(b.reason, 'claim-lock-held');
-  q.heldPatch(); // A's delayed PATCH lands
-  q.clock.t = T0 + CLEAR_QUIESCENCE_MS;
-  const ok = await clearAmbiguousLock({...side('op'), pause: ms => new Promise(r => setTimeout(r, Math.min(ms, 20)))});
-  assert.equal(ok.action, 'cleared'); assert.equal(ok.patchLanded, true);
-  const b2 = await claimItem({owner: 'B', ...side('B'), save: () => assert.fail()});
+  q.date = post; if (local !== undefined) q.local.t = local;
+  const out = await clearAmbiguousLock({...q.side(lockPath, 'op'), isAlive: () => false, pause: async () => {}});
+  // Safety first: B tries to claim, then A's in-flight PATCH lands.
+  const b = await claimItem({owner: 'B', ...q.side(lockPath, 'B'), save() {}}).catch(e => ({action: 'error', message: e.message}));
+  q.heldPatch();
+  assert.ok(!(b.action === 'claimed' && q.record.fields['Claimed By'] !== 'B'), `two owners: clear=${out.action}/${out.reason}, B claimed, record names ${q.record.fields['Claimed By']}`);
+  assert.equal(out.action, 'refused'); assert.equal(out.reason, 'patch-outcome-unknown'); assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(b.reason, 'claim-lock-held'); assert.equal(q.record.fields['Claimed By'], 'A');
+  // Once A's PATCH has applied, the same hostile clocks do not prevent the clear.
+  const ok = await clearAmbiguousLock({...q.side(lockPath, 'op'), isAlive: () => false, pause: async () => {}});
+  assert.equal(ok.action, 'cleared'); assert.equal(ok.outcome, 'patch-applied'); assert.equal(ok.owner, 'A');
+  const b2 = await claimItem({owner: 'B', ...q.side(lockPath, 'B'), save: () => assert.fail()});
   assert.equal(b2.action, 'skip'); assert.equal(q.record.fields['Claimed By'], 'A');
  } finally { await q.close(); fs.rmSync(dir, {recursive: true, force: true}); }
-});
-
-test('loopback reviewer attacks: legacy crash lock and forward local clock jump are both refused; A\'s late PATCH never overwrites B', async () => {
- for (const mode of ['old', 'clock']) {
-  const q = await loopbackQueue(); const local = {t: T0};
-  const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
-  const side = who => ({item: 'rec1', lock: fileClaimLock(lockPath, {now: () => local.t}), get: () => q.api(who)('GET'), patch: f => q.api(who)('PATCH', f)});
-  try {
-   const a = await claimItem({owner: 'A', ...side('A'), save: () => assert.fail()});
-   assert.equal(a.action, 'needs-operator');
-   if (mode === 'old') { fs.writeFileSync(lockPath, JSON.stringify({owner: 'A', pid: 2147483647, at: new Date(T0).toISOString(), state: 'claiming'})); q.clock.t = T0 + CLEAR_QUIESCENCE_MS; local.t = T0 + CLEAR_QUIESCENCE_MS; }
-   else { local.t = T0 + CLEAR_QUIESCENCE_MS; q.clock.t = T0 + 1000; }
-   const out = await clearAmbiguousLock({...side('op'), pause: ms => new Promise(r => setTimeout(r, Math.min(ms, 20))), isAlive: () => false});
-   assert.equal(out.action, 'refused', mode); assert.equal(out.reason, mode === 'old' ? 'no-server-time-in-lock' : 'quiescence-window');
-   const b = await claimItem({owner: 'B', ...side('B'), save: () => assert.fail()});
-   assert.equal(b.reason, 'claim-lock-held');
-   q.heldPatch(); assert.equal(q.record.fields['Claimed By'], 'A');
-  } finally { await q.close(); fs.rmSync(dir, {recursive: true, force: true}); }
- }
 });

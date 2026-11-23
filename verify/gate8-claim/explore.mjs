@@ -21,19 +21,15 @@
  * violating sequence is printed as numbered steps.
  *
  * Scenario claim-x2-clear adds the operator: one run of the REAL
- * clearAmbiguousLock (`gate8-queue.mjs clear-ambiguous`) as a step at any
- * point, its settle pause as a separate step (delayed PATCHes may land
- * between its two reads), and one SERVER-clock step that advances Airtable's
- * clock (the Date header every GET carries as serverDate) by
- * CLEAR_QUIESCENCE_MS. The server-clock step is enabled only when no PATCH is
- * in flight (sent and not yet answered, or timed out and not yet applied): that is the TIMING ASSUMPTION behind the window
- * (no PATCH is applied later than CLEAR_QUIESCENCE_MS of Airtable time after
- * it started). The explorer cannot check that assumption; it checks that, if
- * it holds, a clear never yields two owners. A separate, always-enabled step
- * jumps the LOCAL wall clock (the lock's now()) forward by
- * CLEAR_QUIESCENCE_MS at any point (review attack "clock-forward"). Mutant
- * M8 (no window) and M10 (window on the local clock) show what happens
- * without the server-clock window.
+ * clearAmbiguousLock (`gate8-queue.mjs clear-ambiguous`, without
+ * --force-accept-risk) as a step at any point; its record read is a separate
+ * step, so delayed PATCHes may land before or after it. The clear is
+ * clock-free (it removes the lock only when the record shows the PATCH values
+ * recorded in the lock), so no clock and no timing assumption is modeled: a
+ * delayed PATCH may land at any later point. An always-enabled step still
+ * jumps the LOCAL wall clock (the lock's now()) forward by a day, to show it
+ * has no effect. Mutant M8 (clear whether or not the record matches, which is
+ * what --force-accept-risk does) shows what happens without the match check.
  *
  * Usage: node explore.mjs [--lib <dir with claim.mjs>] [--scenario <name>|all]
  * Exit 0 = rule held in every schedule AND witnesses reached; 1 = violation,
@@ -50,7 +46,7 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] :
 const libDir = path.resolve(opt('--lib', path.join(here, '../../scripts/gate8')));
 const which = opt('--scenario', 'all');
 const MAX = Number(opt('--max-schedules', '200000'));
-const { claimItem, fileClaimLock, clearAmbiguousLock, CLEAR_QUIESCENCE_MS } = await import(pathToFileURL(path.join(libDir, 'claim.mjs')).href);
+const { claimItem, fileClaimLock, clearAmbiguousLock } = await import(pathToFileURL(path.join(libDir, 'claim.mjs')).href);
 
 const SCENARIOS = {
 	// Two scheduled sessions claim the same Ready item.
@@ -62,7 +58,7 @@ const SCENARIOS = {
 	// First claimer's local state save throws after both PATCHes landed.
 	'claim-x2-savefail': { actors: 2, faults: false, saveFails: [1] },
 	'claim-x3': { actors: 3, faults: false, saveFails: [] },
-	// Operator clear (real clearAmbiguousLock) + one clock tick past the window.
+	// Operator clear (real clearAmbiguousLock) at any point, + a local clock jump.
 	// Claimer 2 has no PATCH faults, which bounds the state space.
 	'claim-x2-clear': { actors: 2, faults: true, faultsFor: [1], clear: true, saveFails: [] },
 };
@@ -74,19 +70,16 @@ let runNo = 0;
 
 async function execute(sc, prefix) {
 	const lockDir = path.join(tmpRoot, String(runNo++)); fs.mkdirSync(lockDir);
-	const clock = { t: Date.parse('2026-11-22T10:00:00Z') }; // Airtable's clock (Date header)
-	const local = { t: clock.t }; // this host's wall clock (lock now())
+	const local = { t: Date.parse('2026-11-22T10:00:00Z') }; // this host's wall clock (lock now())
 	const real = fileClaimLock(path.join(lockDir, 'gate8-claim.lock'), { now: () => local.t });
 	const acquired = new Map(); // owner -> what the real acquire() returned (observation only)
 	const lock = { ...real, acquire: o => { const v = real.acquire(o); acquired.set(o, v); return v; } };
 	const record = { fields: { Status: 'Ready', 'Claimed By': '' } };
 	const ops = []; const log = []; const choices = [];
 	const winners = []; let violationAt = -1;
-	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, claimAfterClear: 0 };
+	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, skipAfterClear: 0, landedAfterRefusal: 0, claimAfterClear: 0 };
+	let refusedOnce = false;
 	let clearedOnce = false;
-	// A PATCH is in flight from the moment the claimer sends it (its op is
-	// queued) until it is answered/applied, including a timed-out delayed one.
-	const patchInFlight = () => ops.some(o => o.delayed || o.patch);
 	let ambiguousSeen = false;
 	const show = () => `{Status:${record.fields.Status}, Claimed By:${record.fields['Claimed By'] || '(none)'}}`;
 	const check = () => {
@@ -96,7 +89,7 @@ async function execute(sc, prefix) {
 	};
 	const ambiguous = msg => Object.assign(Error(msg), { code: 'ETIMEDOUT' });
 	const store = who => ({
-		get: () => new Promise(resolve => ops.push({ label: `${who} GET -> `, fire: () => { const v = { ...structuredClone(record), serverDate: new Date(clock.t).toUTCString() }; resolve(v); return show(); } })),
+		get: () => new Promise(resolve => ops.push({ label: `${who} GET -> `, fire: () => { const v = structuredClone(record); resolve(v); return show(); } })),
 		patch: fields => new Promise((resolve, reject) => {
 			const shown = Object.fromEntries(Object.entries(fields).filter(([k]) => k !== 'Claimed At'));
 			const apply = () => Object.assign(record.fields, fields);
@@ -109,7 +102,7 @@ async function execute(sc, prefix) {
 				alts.push({ label: `${p} TIMED OUT, never applied -> `, fire: () => { ambiguousSeen = true; reject(ambiguous('timeout')); return show(); } });
 				if (!sc.noDelayed) alts.push({ label: `${p} TIMED OUT (request still in flight) -> `, fire: () => {
 					ambiguousSeen = true; reject(ambiguous('timeout'));
-					ops.push({ delayed: true, label: `${who}'s delayed PATCH ${JSON.stringify(shown)} is applied by the store -> `, fire: () => { apply(); ev.delayedLanded++; return show(); } });
+					ops.push({ delayed: true, label: `${who}'s delayed PATCH ${JSON.stringify(shown)} is applied by the store -> `, fire: () => { apply(); ev.delayedLanded++; if (refusedOnce) ev.landedAfterRefusal++; return show(); } });
 					return show();
 				} });
 			}
@@ -124,23 +117,20 @@ async function execute(sc, prefix) {
 				.then(out => {
 					if (out.action === 'claimed') { ev.claimed++; if (clearedOnce) ev.claimAfterClear++; winners.push(owner); log.push(`${who} returns action:"claimed"`); check(); }
 					else if (out.action === 'needs-operator') { ev.needsOperator++; log.push(`${who} returns needs-operator (lock kept: ${out.reason})`); }
-					else { if (out.reason === 'claim-lock-held') ev.skipLock++; else ev.skipStatus++; log.push(`${who} returns skip (${out.reason ?? 'status ' + out.status + ', claimed=' + out.claimed})`); }
+					else { if (out.reason === 'claim-lock-held') ev.skipLock++; else { ev.skipStatus++; if (clearedOnce) ev.skipAfterClear++; } log.push(`${who} returns skip (${out.reason ?? 'status ' + out.status + ', claimed=' + out.claimed})`); }
 				}, e => { ev.threw++; log.push(`${who} throws: ${e.message}`); });
 			return `lock.acquire() returned ${acquired.get(owner)}`;
 		} });
 	}
 	if (sc.clear) {
-		ops.push({ label: `Airtable's clock advances CLEAR_QUIESCENCE_MS (${CLEAR_QUIESCENCE_MS / 60000} min; assumption: no PATCH still in flight) -> `,
-			enabled: () => !patchInFlight(), fire: () => { clock.t += CLEAR_QUIESCENCE_MS; return `server now ${new Date(clock.t).toISOString()}`; } });
-		ops.push({ label: `LOCAL wall clock jumps forward ${CLEAR_QUIESCENCE_MS / 60000} min (Airtable's clock unchanged) -> `,
-			fire: () => { local.t += CLEAR_QUIESCENCE_MS; return `local now ${new Date(local.t).toISOString()}`; } });
+		ops.push({ label: 'LOCAL wall clock jumps forward 1 day -> ',
+			fire: () => { local.t += 86_400_000; return `local now ${new Date(local.t).toISOString()}`; } });
 		ops.push({ label: 'operator runs gate8-queue.mjs clear-ambiguous -> ', fire: () => {
 			const s = store('operator');
-			const pause = () => new Promise(resolve => ops.push({ label: 'operator settle pause between the two reads ends -> ', fire: () => { resolve(); return show(); } }));
-			clearAmbiguousLock({ lock: real, item: undefined, get: s.get, pause })
+			clearAmbiguousLock({ lock: real, item: undefined, get: s.get, warn: () => {} })
 				.then(out => {
-					if (out.action === 'cleared') { ev.cleared++; clearedOnce = true; log.push(`operator clear: cleared (patchLanded=${out.patchLanded})`); }
-					else { if (out.action === 'refused') ev.clearRefused++; log.push(`operator clear: ${out.action}${out.reason ? ' (' + out.reason + ')' : ''}`); }
+					if (out.action === 'cleared' || out.action === 'force-cleared') { ev.cleared++; clearedOnce = true; log.push(`operator clear: ${out.action} (${out.outcome ?? out.reason})`); }
+					else { if (out.action === 'refused') { ev.clearRefused++; refusedOnce = true; } log.push(`operator clear: ${out.action}${out.reason ? ' (' + out.reason + ')' : ''}`); }
 				}, e => { log.push(`operator clear throws: ${e.message}`); });
 			return 'started';
 		} });
@@ -171,7 +161,7 @@ async function execute(sc, prefix) {
 
 async function explore(sc) {
 	let prefix = [], schedules = 0, shortest = null, maxDepth = 0;
-	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, claimAfterClear: 0 };
+	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, skipAfterClear: 0, landedAfterRefusal: 0, claimAfterClear: 0 };
 	for (;;) {
 		const r = await execute(sc, prefix); schedules++;
 		maxDepth = Math.max(maxDepth, r.choices.length);
@@ -193,7 +183,7 @@ for (const name of names) {
 	if (!sc) { console.error(`unknown scenario ${name}`); process.exit(2); }
 	const res = await explore(sc);
 	const want = { claimed: true, skipLock: true, skipStatus: true, lostResponse: sc.faults, failedPatch: sc.faults, threw: sc.faults || sc.saveFails.length > 0,
-		delayedLanded: sc.faults && !sc.noDelayed, needsOperator: sc.faults, keptLock: sc.faults, cleared: !!sc.clear, clearRefused: !!sc.clear, claimAfterClear: !!sc.clear };
+		delayedLanded: sc.faults && !sc.noDelayed, needsOperator: sc.faults, keptLock: sc.faults, cleared: !!sc.clear, clearRefused: !!sc.clear, skipAfterClear: !!sc.clear, landedAfterRefusal: !!sc.clear };
 	const vacuous = Object.entries(want).filter(([k, w]) => w && res.reached[k] === 0).map(([k]) => k);
 	const bad = res.shortest !== null || res.truncated || vacuous.length > 0;
 	failed ||= bad;

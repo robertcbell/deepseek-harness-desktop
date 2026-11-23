@@ -23,20 +23,17 @@
 (*  Crash(c)      process dies at any point: lock file is NOT removed      *)
 (*  Clear(c)      operator runs `gate8-queue.mjs clear-ambiguous <item>`   *)
 (*                (clearAmbiguousLock) on c's lock after c ended in        *)
-(*                "operator" or "crashed". With ClearWaits it is enabled   *)
-(*                only once no PATCH of c is still in flight: this is the  *)
-(*                TIMING ASSUMPTION that CLEAR_QUIESCENCE_MS (10 min after *)
-(*                the last PATCH started) outlasts every in-flight PATCH.  *)
-(*                TLC does not check that assumption; it checks that, if   *)
-(*                it holds, clearing never yields two owners. The window   *)
-(*                is measured on AIRTABLE'S clock (HTTP Date of the GET    *)
-(*                before the PATCH vs. Date of the clear's own reads), so  *)
-(*                the model has no local clock: a local wall-clock jump    *)
-(*                cannot enable Clear. A lock without a server-clock start *)
-(*                (older claim.mjs format) is never cleared, i.e. Clear is *)
-(*                simply not taken. The explorer (explore.mjs) exercises   *)
-(*                the local-clock jump on the real code; mutant M10 there  *)
-(*                (window on the local clock) is KILLED.                   *)
+(*                "operator" or "crashed". CLOCK-FREE: before each PATCH   *)
+(*                the lock durably records that PATCH's values (rec[c]).   *)
+(*                With ClearMode "match", Clear is enabled only when the   *)
+(*                record shows the recorded values (the PATCH applied, so  *)
+(*                none of c's writes is pending), or when no PATCH was     *)
+(*                recorded (none was sent). There is no clock and no       *)
+(*                timing assumption: a pending PATCH may land at any later *)
+(*                step. ClearMode "any" is the --force-accept-risk         *)
+(*                override (and the old "delete the lock" advice);         *)
+(*                "mismatch" is the mutant that clears exactly when the    *)
+(*                record does NOT show the recorded values.                *)
 (*                                                                         *)
 (* Flags model the guards so a mutation is a one-line cfg change:          *)
 (*   UseLock          the claim lock                                       *)
@@ -46,13 +43,14 @@
 (*   KeepOnAmbiguous  keep the lock after an ambiguous PATCH (review fix 1)*)
 (*   KeepOnDefinite   keep the lock after a definite 4xx (wrong; leaks)    *)
 (*   AllowClear       the operator clear action exists                     *)
-(*   ClearWaits       clear waits out the quiescence window (FALSE = the   *)
-(*                    old advice: delete the lock once no claimer runs)    *)
+(*   ClearMode        "match": clear only when the record shows the        *)
+(*                    recorded PATCH values (or none was recorded);        *)
+(*                    "any": --force-accept-risk; "mismatch": mutant       *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Claimers, UseLock, CheckStatus, HoldToEnd, Readback, Faults,
-          KeepOnAmbiguous, KeepOnDefinite, AllowClear, ClearWaits
+          KeepOnAmbiguous, KeepOnDefinite, AllowClear, ClearMode
 
 None == "none"
 
@@ -67,9 +65,11 @@ VARIABLES
     pendDoing,  \* claimers whose Doing PATCH timed out and may still be applied
     ambiguous,  \* claimers that saw an ambiguous PATCH result
     landed,     \* number of delayed PATCHes applied (witness)
-    clears      \* number of operator clears (witness)
+    clears,     \* number of operator clears (witness)
+    rec,        \* rec[c]: last PATCH recorded (fsynced) in c's lock before sending: "none" | "owner" | "doing"
+    appliedClears \* clears that matched a recorded, applied PATCH (witness)
 
-vars == <<pc, status, owner, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+vars == <<pc, status, owner, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 Pcs == {"idle", "read", "patchOwner", "readback", "patchDoing", "finish",
         "claimed", "skipped", "failed", "operator", "crashed"}
@@ -86,6 +86,8 @@ TypeOK ==
     /\ ambiguous \subseteq Claimers
     /\ landed \in Nat
     /\ clears \in Nat
+    /\ rec \in [Claimers -> {"none", "owner", "doing"}]
+    /\ appliedClears \in Nat
 
 Init ==
     /\ pc = [c \in Claimers |-> "idle"]
@@ -97,6 +99,8 @@ Init ==
     /\ pendOwner = {} /\ pendDoing = {} /\ ambiguous = {}
     /\ landed = 0
     /\ clears = 0
+    /\ rec = [c \in Claimers |-> "none"]
+    /\ appliedClears = 0
 
 \* finally { if (!keep) lock.release() }. Only the creator reaches the try
 \* block, so a release removes its own file.
@@ -119,7 +123,7 @@ Acquire(c) ==
             THEN /\ lock' = c /\ held' = [held EXCEPT ![c] = TRUE]
                  /\ pc' = [pc EXCEPT ![c] = "read"]
             ELSE /\ pc' = [pc EXCEPT ![c] = "skipped"] /\ UNCHANGED <<lock, held>>
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 Read(c) ==
     /\ pc[c] = "read"
@@ -129,102 +133,124 @@ Read(c) ==
             /\ IF HoldToEnd THEN UNCHANGED <<lock, held>>
                ELSE /\ lock' = IF held[c] THEN None ELSE lock
                     /\ held' = [held EXCEPT ![c] = FALSE]
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 PatchOwnerOk(c) ==
     /\ pc[c] = "patchOwner"
     /\ owner' = c /\ pc' = [pc EXCEPT ![c] = IF Readback THEN "readback" ELSE "patchDoing"]
-    /\ UNCHANGED <<status, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "owner"]
 
 PatchOwnerRejected(c) ==   \* HTTP 4xx: definitely not applied
     /\ Faults /\ pc[c] = "patchOwner"
     /\ EndDefinite(c)
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "owner"]
 
 PatchOwnerLost(c) ==       \* applied, response lost: ambiguous
     /\ Faults /\ pc[c] = "patchOwner"
     /\ owner' = c /\ ambiguous' = ambiguous \cup {c} /\ EndAmbiguous(c)
-    /\ UNCHANGED <<status, claimed, pendOwner, pendDoing, landed, clears>>
+    /\ UNCHANGED <<status, claimed, pendOwner, pendDoing, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "owner"]
 
 PatchOwnerTimeout(c) ==    \* no answer; may be applied later: ambiguous
     /\ Faults /\ pc[c] = "patchOwner"
     /\ pendOwner' = pendOwner \cup {c} /\ ambiguous' = ambiguous \cup {c} /\ EndAmbiguous(c)
-    /\ UNCHANGED <<status, owner, claimed, pendDoing, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendDoing, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "owner"]
 
 DelayedOwner(c) ==         \* the store applies a timed-out owner PATCH
     /\ c \in pendOwner
     /\ owner' = c /\ pendOwner' = pendOwner \ {c} /\ landed' = landed + 1
-    /\ UNCHANGED <<pc, status, lock, held, claimed, pendDoing, ambiguous, clears>>
+    /\ UNCHANGED <<pc, status, lock, held, claimed, pendDoing, ambiguous, clears, rec, appliedClears>>
 
 DropOwner(c) ==            \* ...or never applies it
     /\ c \in pendOwner
     /\ pendOwner' = pendOwner \ {c}
-    /\ UNCHANGED <<pc, status, owner, lock, held, claimed, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<pc, status, owner, lock, held, claimed, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 ReadbackStep(c) ==
     /\ pc[c] = "readback"
     /\ IF owner # c THEN End(c, "failed")
        ELSE /\ pc' = [pc EXCEPT ![c] = "patchDoing"] /\ UNCHANGED <<lock, held>>
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 PatchDoingOk(c) ==
     /\ pc[c] = "patchDoing"
     /\ status' = "Doing" /\ pc' = [pc EXCEPT ![c] = "finish"]
-    /\ UNCHANGED <<owner, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<owner, lock, held, claimed, pendOwner, pendDoing, ambiguous, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "doing"]
 
 PatchDoingRejected(c) ==
     /\ Faults /\ pc[c] = "patchDoing"
     /\ EndDefinite(c)
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "doing"]
 
 PatchDoingLost(c) ==
     /\ Faults /\ pc[c] = "patchDoing"
     /\ status' = "Doing" /\ ambiguous' = ambiguous \cup {c} /\ EndAmbiguous(c)
-    /\ UNCHANGED <<owner, claimed, pendOwner, pendDoing, landed, clears>>
+    /\ UNCHANGED <<owner, claimed, pendOwner, pendDoing, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "doing"]
 
 PatchDoingTimeout(c) ==
     /\ Faults /\ pc[c] = "patchDoing"
     /\ pendDoing' = pendDoing \cup {c} /\ ambiguous' = ambiguous \cup {c} /\ EndAmbiguous(c)
-    /\ UNCHANGED <<status, owner, claimed, pendOwner, landed, clears>>
+    /\ UNCHANGED <<status, owner, claimed, pendOwner, landed, clears, appliedClears>>
+    /\ rec' = [rec EXCEPT ![c] = "doing"]
 
 DelayedDoing(c) ==
     /\ c \in pendDoing
     /\ status' = "Doing" /\ pendDoing' = pendDoing \ {c} /\ landed' = landed + 1
-    /\ UNCHANGED <<pc, owner, lock, held, claimed, pendOwner, ambiguous, clears>>
+    /\ UNCHANGED <<pc, owner, lock, held, claimed, pendOwner, ambiguous, clears, rec, appliedClears>>
 
 DropDoing(c) ==
     /\ c \in pendDoing
     /\ pendDoing' = pendDoing \ {c}
-    /\ UNCHANGED <<pc, status, owner, lock, held, claimed, pendOwner, ambiguous, landed, clears>>
+    /\ UNCHANGED <<pc, status, owner, lock, held, claimed, pendOwner, ambiguous, landed, clears, rec, appliedClears>>
 
 Finish(c) ==
     /\ pc[c] = "finish"
     /\ claimed' = claimed \cup {c}
     /\ End(c, "claimed")
-    /\ UNCHANGED <<status, owner, pendOwner, pendDoing, ambiguous, landed, clears>>
+    /\ UNCHANGED <<status, owner, pendOwner, pendDoing, ambiguous, landed, clears, rec, appliedClears>>
 
 \* A killed process: its lock file stays (fail closed for later claimers).
 \* A process killed while a PATCH is on the wire leaves that PATCH in flight.
 Crash(c) ==
     /\ Faults /\ pc[c] \in Active
     /\ pc' = [pc EXCEPT ![c] = "crashed"]
-    /\ \/ UNCHANGED <<pendOwner, pendDoing>>
-       \/ pc[c] = "patchOwner" /\ pendOwner' = pendOwner \cup {c} /\ UNCHANGED pendDoing
-       \/ pc[c] = "patchDoing" /\ pendDoing' = pendDoing \cup {c} /\ UNCHANGED pendOwner
-    /\ UNCHANGED <<status, owner, lock, held, claimed, ambiguous, landed, clears>>
+    \* At patchOwner/patchDoing the process may die before the lock write
+    \* (nothing recorded, nothing sent), after it (recorded, not sent), or
+    \* after sending (recorded and in flight). The record is fsynced before
+    \* the PATCH is sent, so a PATCH in flight is always recorded.
+    /\ \/ UNCHANGED <<pendOwner, pendDoing, rec>>
+       \/ pc[c] = "patchOwner" /\ rec' = [rec EXCEPT ![c] = "owner"]
+          /\ (pendOwner' = pendOwner \/ pendOwner' = pendOwner \cup {c}) /\ UNCHANGED pendDoing
+       \/ pc[c] = "patchDoing" /\ rec' = [rec EXCEPT ![c] = "doing"]
+          /\ (pendDoing' = pendDoing \/ pendDoing' = pendDoing \cup {c}) /\ UNCHANGED pendOwner
+    /\ UNCHANGED <<status, owner, lock, held, claimed, ambiguous, landed, clears, appliedClears>>
 
 \* clearAmbiguousLock: the operator removes the lock of a claimer that ended
-\* after an ambiguous PATCH or crashed (never a running claimer). With
-\* ClearWaits, only when none of c's PATCHes is still in flight; this stands
-\* for "CLEAR_QUIESCENCE_MS of Airtable time has passed since the last PATCH
-\* started", which is an assumption about Airtable, not something TLC can
-\* check. Measuring on Airtable's clock is what makes this abstraction sound
-\* under local clock jumps; it is not modelled as a separate variable.
+\* after an ambiguous PATCH or crashed (never a running claimer). The record
+\* "shows" c's recorded PATCH when it holds c's owner/claim id (owner step) or
+\* additionally Status Doing (Doing step). Each PATCH applies at most once,
+\* so a match means none of c's writes is still pending. No recorded PATCH
+\* means none was sent (recorded and fsynced before sending). No clock.
+Shows(c) ==
+    CASE rec[c] = "none"  -> TRUE
+      [] rec[c] = "owner" -> owner = c
+      [] rec[c] = "doing" -> owner = c /\ status = "Doing"
+ClearAllowed(c) ==
+    CASE ClearMode = "match"    -> Shows(c)
+      [] ClearMode = "mismatch" -> ~Shows(c)
+      [] ClearMode = "any"      -> TRUE
 Clear(c) ==
     /\ AllowClear /\ held[c] /\ pc[c] \in {"operator", "crashed"}
-    /\ ClearWaits => c \notin pendOwner \cup pendDoing
+    /\ ClearAllowed(c)
     /\ lock' = None /\ held' = [held EXCEPT ![c] = FALSE] /\ clears' = clears + 1
-    /\ UNCHANGED <<pc, status, owner, claimed, pendOwner, pendDoing, ambiguous, landed>>
+    /\ appliedClears' = IF rec[c] # "none" /\ Shows(c) THEN appliedClears + 1 ELSE appliedClears
+    /\ UNCHANGED <<pc, status, owner, claimed, pendOwner, pendDoing, ambiguous, landed, rec>>
 
 Next == \E c \in Claimers :
     \/ Acquire(c) \/ Read(c)
@@ -258,6 +284,8 @@ NeverLanded     == landed = 0
 NeverCleared    == clears = 0
 \* A clear followed by another claimer's successful claim.
 NeverClaimAfterClear == ~(clears > 0 /\ claimed # {})
+\* A successful clear that accepted a recorded, applied PATCH as c's claim.
+NeverAppliedClear == appliedClears = 0
 
 \* Every claimer terminates (no lock deadlock).
 AllDone == <>(\A c \in Claimers : pc[c] \in {"claimed", "skipped", "failed", "operator", "crashed"})

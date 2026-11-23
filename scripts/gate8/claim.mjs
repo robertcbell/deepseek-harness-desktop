@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 
 // One Queue item has at most one owner.
 //
@@ -15,36 +16,50 @@ import fs from 'node:fs';
 // (link fails with EEXIST if the lock exists). A failed metadata write
 // therefore never leaves a lock behind.
 //
-// now() is the local wall clock used for the informational local timestamps in
-// the lock (injectable for the explorer and tests). The clear window never
-// uses it: it uses the server-clock fields acquiredServerAt/patchServerStart.
+// Durability: every lock write is fsynced (the file, then its directory
+// after the link/rename), so a PATCH is sent only after the lock record that
+// describes it is on disk. A crash or power loss therefore never leaves a lock
+// that hides a PATCH which was sent.
+//
+// now() is the local wall clock, used only for informational timestamps and
+// the claim's `Claimed At` value (injectable for the explorer and tests). No
+// safety decision depends on any clock.
+export const LOCK_FORMAT = 'gate8-claim-lock/2';
 export function fileClaimLock(lockPath, { now = Date.now } = {}) {
  let seq = 0;
  const iso = () => new Date(now()).toISOString();
+ const dir = path.dirname(lockPath);
  const tmpName = () => `${lockPath}.tmp-${process.pid}-${++seq}-${Math.random().toString(36).slice(2)}`;
+ const syncDir = () => { const fd = fs.openSync(dir, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } };
  const writeTemp = data => {
   const tmp = tmpName();
-  try { fs.writeFileSync(tmp, JSON.stringify(data), { flag: 'wx', mode: 0o600 }); }
-  catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+  try {
+   const fd = fs.openSync(tmp, 'wx', 0o600);
+   try { fs.writeSync(fd, JSON.stringify(data)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
   return tmp;
  };
  return {
   path: lockPath,
   now,
   acquire(owner, extra = {}) {
-   const tmp = writeTemp({ ...extra, owner, pid: process.pid, at: iso(), state: 'claiming' });
-   try { fs.linkSync(tmp, lockPath); return true; }
+   const tmp = writeTemp({ ...extra, format: LOCK_FORMAT, owner, pid: process.pid, at: iso(), state: 'claiming' });
+   try { fs.linkSync(tmp, lockPath); }
    catch (e) { if (e.code === 'EEXIST') return false; throw e; }
    finally { fs.rmSync(tmp, { force: true }); }
+   syncDir();
+   return true;
   },
-  // Rewrite the held lock's metadata (atomic rename over our own lock). The
-  // lock stays held even if this fails. It never re-creates a lock that is
-  // gone (rename would do that silently), so a lost lock stops the claim.
+  // Rewrite the held lock's metadata (atomic rename over our own lock, then
+  // fsync of the directory). The lock stays held even if this fails. It never
+  // re-creates a lock that is gone (rename would do that silently), so a lost
+  // lock stops the claim.
   mark(fields) {
    const cur = this.holder();
    if (!cur) throw Object.assign(Error(`Claim lock ${lockPath} is no longer held`), { code: 'ELOCKLOST' });
    const tmp = writeTemp({ ...cur, ...fields, markedAt: iso() });
    try { fs.renameSync(tmp, lockPath); } finally { fs.rmSync(tmp, { force: true }); }
+   syncDir();
   },
   release() { fs.rmSync(lockPath, { force: true }); },
   holder() { try { return JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { return null; } },
@@ -61,67 +76,52 @@ export const definitePatchFailure = e => Number.isInteger(e?.httpStatus) && e.ht
 // Never delete the lock file by hand. A timed-out PATCH may still be applied
 // by Airtable after the claimer gave up; if the lock is removed first, the next
 // claimer can claim and the late PATCH then overwrites its owner (reproduced
-// on a loopback server). The only supported way to clear the lock is
+// on a loopback server). The supported way to clear the lock is
 // `node gate8-queue.mjs clear-ambiguous <item>`, which calls clearAmbiguousLock.
 //
-// CLEAR_QUIESCENCE_MS: how long after the last PATCH the claimer STARTED a
-// clear is refused. The window is measured on AIRTABLE'S clock, never the
-// local one: just before every PATCH the lock records patchServerStart, the
-// HTTP Date header of the GET that immediately preceded it, and the clear
-// compares that with the Date header of its own reads. A local wall-clock
-// jump (NTP step, manual change) therefore cannot shorten the window.
-// Rationale for 10 min: the client aborts every Airtable request after
-// ownershipReadPolicy.deadlineMs (20 s, scripts/gate8/retry-read.mjs) and a
-// dead process closes its socket, so no request bytes leave the host more
-// than ~20 s after the PATCH started. Airtable documents no server-side
-// request lifetime; 10 minutes is a conservative bound, 30x the client
-// deadline, on how long an already-received PATCH could still be applied.
-// This is a TIMING ASSUMPTION, not a guarantee. It also assumes the step from
-// the preceding GET's answer to the PATCH leaving the host is short (one
-// local lock write; a host suspend exactly there eats into the margin), that
-// Airtable's clock does not step backwards by minutes, and it accepts the
-// Date header's 1 s resolution. The two identical reads below are a second,
-// independent check.
-export const CLEAR_QUIESCENCE_MS = 10 * 60 * 1000;
-// Gap between the two record reads that must be identical before clearing.
-export const CLEAR_SETTLE_MS = 5000;
-
-// Server time of a Queue read: get() must return the record with
-// `serverDate`, the response's HTTP Date header (scripts/gate8/airtable-api.mjs
-// attaches it). NaN when missing or unparseable.
-export const serverTime = r => typeof r?.serverDate === 'string' ? Date.parse(r.serverDate) : NaN;
-const serverIso = (r, what) => {
- const t = serverTime(r);
- if (!Number.isFinite(t)) throw Object.assign(Error(`The Queue read before ${what} carried no parseable server Date header; nothing was sent (the clear window is measured on Airtable's clock).`), { code: 'ENOSERVERTIME' });
- return new Date(t).toISOString();
-};
+// Clock-free rule. Before each PATCH the lock records (durably, see
+// fileClaimLock) the exact fields of that PATCH and `expect`: the record
+// values that prove it was applied, including the claim id (`Claimed By` =
+// owner plus the unique `Claimed At` of this claim). A PATCH is applied at
+// most once, so once the record shows `expect`, no write of that claimer is
+// still pending: the claim is the claimer's, and the lock can go. While the
+// record does not show `expect`, the PATCH outcome is unknown and the lock
+// stays. No clock, server Date header or waiting period is involved, so clock
+// jumps and stale, invalid or backward Date headers cannot open the clear.
+//
+// The only exception is the documented operator override
+// `clear-ambiguous <item> --force-accept-risk` (Gate 8 is synthetic): it
+// removes the lock with an explicit warning that a late write could
+// overwrite a later claimer. Safety without the override assumes no timing.
 
 const clearCommand = item => `node gate8-queue.mjs clear-ambiguous ${item ?? '<item>'}`;
-const operatorAction = item => `Do not delete the lock file: a timed-out PATCH can still land. Run \`${clearCommand(item)}\`; it refuses until Airtable's clock shows ${CLEAR_QUIESCENCE_MS / 60000} minutes since the last PATCH started and the record reads the same twice.`;
-const stableJson = v => JSON.stringify(v, (k, x) => x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map(key => [key, x[key]])) : x);
+const operatorAction = item => `Do not delete the lock file: a timed-out PATCH can still land. Run \`${clearCommand(item)}\`; it clears the lock only once the Queue record shows the recorded PATCH values (then that PATCH has applied and nothing is pending), and otherwise refuses and explains the options.`;
 const pidAlive = pid => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-const preClaim = r => r?.fields?.Status === 'Ready' && !r?.fields?.['Claimed By'];
+// Equal field value; ISO datetimes are compared by instant (Airtable may
+// normalize the string form). Anything else must be identical.
+const isoLike = v => typeof v === 'string' && /^\d{4}-\d\d-\d\dT/.test(v);
+const sameValue = (a, b) => a === b || (isoLike(a) && isoLike(b) && Number.isFinite(Date.parse(a)) && Date.parse(a) === Date.parse(b));
+export const recordShows = (fields, expect) => !!expect && typeof expect === 'object' && Object.keys(expect).length > 0
+ && Object.entries(expect).every(([k, v]) => sameValue(fields?.[k], v));
 
-// clearAmbiguousLock({lock, item, get}): remove a claim lock left by an
-// ambiguous PATCH (state 'ambiguous') or by a dead claimer, only when no
-// claim PATCH can still land:
-//  1. the lock's state is 'ambiguous', or its holder process is dead
-//     (a live claimer's lock is never cleared);
-//  2. the lock records a server-clock start: patchServerStart for any lock
-//     that may have sent a PATCH, or, for a lock still in state 'claiming'
-//     with no PATCH recorded, acquiredServerAt. Missing or unparseable ->
-//     refused: such a lock (e.g. one written by an older claim.mjs, which
-//     kept only local-clock times) is never cleared by this command;
-//  3. both record reads carry a server Date and serverNow - start >=
-//     quiescenceMs on each;
-//  4. the two reads, settleMs apart, are identical; for a 'claiming' lock
-//     both must also still show the pre-claim state (Ready, unclaimed);
-//  5. the lock still has the content inspected in step 1.
-// The local clock is never used for the window. Clears are serialized by a
-// second O_EXCL file `<lock>.clear`. Returns {action:'cleared', patchLanded,
-// record} or {action:'refused', reason, ...}; a refusal never removes the lock.
-export async function clearAmbiguousLock({ lock, item, get, pause = ms => new Promise(r => setTimeout(r, ms)),
- quiescenceMs = CLEAR_QUIESCENCE_MS, settleMs = CLEAR_SETTLE_MS, isAlive = pidAlive }) {
+// clearAmbiguousLock({lock, item, get, forceAcceptRisk}): clear a claim lock
+// left by an ambiguous PATCH (state 'ambiguous') or by a dead claimer.
+//  1. Refuse a wrong item, and a lock whose holder still runs (unless its
+//     state is 'ambiguous': that claimer has already returned).
+//  2. A current-format lock still in state 'claiming' never recorded a PATCH;
+//     the record is fsynced before any PATCH is sent, so none was sent: the
+//     lock is removed (outcome 'no-patch-sent').
+//  3. Otherwise read the record once. If it shows the lock's `expect` values,
+//     the recorded PATCH has applied: report the claim as the holder's
+//     (outcome 'patch-applied') and remove the lock, as the normal post-claim
+//     flow does.
+//  4. If it does not (or the lock is a legacy format without recorded PATCH
+//     values), refuse and keep the lock: the PATCH may still apply.
+//     With forceAcceptRisk the lock is removed anyway and `warn` logs an
+//     explicit warning (action 'force-cleared').
+// Clears are serialized by a second O_EXCL file `<lock>.clear`, and the lock
+// must still have the content inspected in step 1.
+export async function clearAmbiguousLock({ lock, item, get, forceAcceptRisk = false, isAlive = pidAlive, warn = m => console.error(m) }) {
  const refused = (reason, extra = {}) => ({ action: 'refused', reason, lockPath: lock.path, ...extra });
  const raw = () => { try { return fs.readFileSync(lock.path, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
  const mutex = `${lock.path}.clear`;
@@ -130,51 +130,56 @@ export async function clearAmbiguousLock({ lock, item, get, pause = ms => new Pr
  try {
   const seen = raw();
   if (seen === null) return { action: 'no-lock', lockPath: lock.path };
-  let h; try { h = JSON.parse(seen); } catch { return refused('lock-unreadable'); }
-  if (h.item && item && h.item !== item) return refused('wrong-item', { holder: h, message: `The lock is for item ${h.item}, not ${item}.` });
-  if (h.state !== 'ambiguous' && isAlive(h.pid)) return refused('claimer-running', { holder: h, message: `Claimer pid ${h.pid} is still running; wait for it to finish.` });
-  // Any sign of a PATCH (a non-claiming state or a recorded start) means the
-  // window must run from the server-clock PATCH start.
-  const mayHavePatched = h.state !== 'claiming' || 'patchStartedAt' in h || 'patchServerStart' in h;
-  const start = Date.parse(mayHavePatched ? h.patchServerStart ?? '' : h.acquiredServerAt ?? '');
-  if (!Number.isFinite(start)) return refused('no-server-time-in-lock', { holder: h, message: mayHavePatched
-   ? 'The lock records no server-clock PATCH start (patchServerStart), so the time since the last PATCH started cannot be measured safely: its local-clock times may predate the PATCH or be skewed by a clock jump (such locks come only from an older claim.mjs). This command will not clear it; the lock is kept. Escalate to the Lead.'
-   : 'The lock is in the claiming state and records no server-clock acquisition time (acquiredServerAt), so it may come from an older claim.mjs that could have sent a PATCH without recording it. It is treated as ambiguous and not cleared by this command; the lock is kept. Escalate to the Lead.' });
-  const noServerTime = () => refused('no-server-time', { holder: h, message: 'A Queue read carried no parseable Date header, so the window cannot be measured on the server clock. Lock kept; retry later.' });
-  const tooEarly = n => refused('quiescence-window', { holder: h, waitMs: quiescenceMs - (n - start),
-   message: `A claim PATCH may still land. Retry after ${new Date(start + quiescenceMs).toISOString()} by Airtable's clock (${Math.ceil((quiescenceMs - (n - start)) / 1000)} s).` });
-  const r1 = await get(); const n1 = serverTime(r1);
-  if (!Number.isFinite(n1)) return noServerTime();
-  if (n1 - start < quiescenceMs) return tooEarly(n1);
-  await pause(settleMs);
-  const r2 = await get(); const n2 = serverTime(r2);
-  if (!Number.isFinite(n2)) return noServerTime();
-  if (n2 - start < quiescenceMs) return tooEarly(n2);
-  if (stableJson(r1?.fields) !== stableJson(r2?.fields)) return refused('record-changing', { holder: h, first: r1?.fields, second: r2?.fields,
-   message: 'The record changed between two reads; a PATCH may still be landing. Lock kept; retry later.' });
-  if (!mayHavePatched && !(preClaim(r1) && preClaim(r2))) return refused('not-pre-claim', { holder: h, record: r2?.fields,
-   message: 'The lock records no PATCH, but the record no longer shows its pre-claim state (Ready, unclaimed). Lock kept; escalate to the Lead.' });
-  if (raw() !== seen) return refused('lock-changed', { message: 'The lock changed during the clear; nothing removed.' });
-  fs.rmSync(lock.path);
-  const f = r2.fields ?? {};
-  const ownerLanded = f['Claimed By'] === h.owner;
-  const patchLanded = h.step === 'doing' ? f.Status === 'Doing' : ownerLanded;
-  return { action: 'cleared', lockPath: lock.path, holder: h, patchLanded, record: { Status: f.Status ?? null, 'Claimed By': f['Claimed By'] || null },
-   message: patchLanded ? `${h.owner}'s ${h.step ?? 'claim'} PATCH landed: the record names ${f['Claimed By'] || '(none)'} with Status ${f.Status}; that claimer has exited, so review/reset the item.`
-    : `${h.owner}'s ${h.step ?? 'claim'} PATCH did not land; the record is ${f.Status}/${f['Claimed By'] || '(unclaimed)'}.` };
+  let h = null; try { h = JSON.parse(seen); } catch {}
+  const who = h?.owner ?? 'the claimer';
+  if (h?.item && item && h.item !== item) return refused('wrong-item', { holder: h, message: `The lock is for item ${h.item}, not ${item}.` });
+  if (h && h.state !== 'ambiguous' && isAlive(h.pid)) return refused('claimer-running', { holder: h, message: `Claimer pid ${h.pid} is still running; wait for it to finish.` });
+  const remove = () => { if (raw() !== seen) return false; fs.rmSync(lock.path); return true; };
+  const lockChanged = () => refused('lock-changed', { message: 'The lock changed during the clear; nothing removed.' });
+  const current = h?.format === LOCK_FORMAT;
+  if (current && h.state === 'claiming') {
+   if (!remove()) return lockChanged();
+   return { action: 'cleared', outcome: 'no-patch-sent', lockPath: lock.path, holder: h,
+    message: `${who} recorded no PATCH, and every PATCH is recorded durably before it is sent, so none was sent. Lock cleared.` };
+  }
+  const hasExpect = current && h.expect && typeof h.expect === 'object' && Object.keys(h.expect).length > 0;
+  let record = null, readError = null;
+  if (hasExpect) {
+   try { record = await get(); } catch (e) { if (!forceAcceptRisk) throw e; readError = String(e?.message ?? e); }
+   if (record && recordShows(record.fields, h.expect)) {
+    if (!remove()) return lockChanged();
+    const f = record.fields ?? {};
+    return { action: 'cleared', outcome: 'patch-applied', owner: h.owner, lockPath: lock.path, holder: h, record: { Status: f.Status ?? null, 'Claimed By': f['Claimed By'] || null },
+     message: `${who}'s ${h.step ?? 'claim'} PATCH has applied: the record shows its recorded values (Status ${f.Status}, Claimed By ${f['Claimed By']}), so no write of ${who} is pending. The claim is ${who}'s; lock cleared as after a completed claim. ${who}'s process has ended, so review or reset the item.` };
+   }
+  }
+  const reason = hasExpect ? 'patch-outcome-unknown' : 'legacy-lock';
+  const why = hasExpect
+   ? `The record does not show ${who}'s recorded ${h.step ?? ''} PATCH values ${JSON.stringify(h.expect)}, so that PATCH's outcome is unknown: it may still apply.`
+   : 'The lock records no PATCH values (it is unreadable or was written by an older claim.mjs), so whether a PATCH is still pending cannot be decided.';
+  if (!forceAcceptRisk) return refused(reason, { holder: h, record: record?.fields,
+   message: `${why} The lock is kept. Safe options: wait and rerun \`${clearCommand(item ?? h?.item)}\` later (it clears as soon as the record shows those values), or run \`${clearCommand(item ?? h?.item)} --force-accept-risk\`, which removes the lock and accepts that a late write could overwrite a later claimer.` });
+  const warning = `WARNING: --force-accept-risk: ${why} The claim lock ${lock.path} is being removed anyway. If that PATCH applies later it can overwrite a later claimer's ownership (two owners). Check the record before the next claim.`;
+  warn(warning);
+  if (!remove()) return lockChanged();
+  return { action: 'force-cleared', reason, lockPath: lock.path, holder: h, warning, ...(readError ? { readError } : {}), record: record?.fields ?? null };
  } finally { fs.rmSync(mutex, { force: true }); }
 }
 
-// get(): current record with `serverDate` (its HTTP Date header; a read
-// without one stops the claim before any PATCH); patch(fields): PATCH the record; save(owner): persist
-// local ownership. Returns {action:'claimed'} only while holding the lock.
-// The lock is released only when no claim PATCH can still land: after the
-// claim completes, after a skip/read failure, or after a definite (4xx)
+// get(): current record; patch(fields): PATCH the record; save(owner):
+// persist local ownership. Returns {action:'claimed'} only while holding the
+// lock. The lock is released only when no claim PATCH can still land: after
+// the claim completes, after a skip/read failure, or after a definite (4xx)
 // PATCH failure. An ambiguous PATCH result keeps the lock, marks it
 // "ambiguous" and returns action 'needs-operator'. A lock left by a crash or
 // an ambiguous PATCH makes later claims skip (fail closed) until an operator
 // runs clearAmbiguousLock (`gate8-queue.mjs clear-ambiguous <item>`); nothing
 // removes it automatically.
+// Before each PATCH the lock durably records {state:'patching', step, patch:
+// the exact fields sent, expect: the record values that prove it applied}.
+// The claim id is this claim's `Claimed At` value, so `expect` is unique to
+// this claim: owner step {Claimed By, Claimed At}; Doing step {Status:'Doing',
+// Claimed By, Claimed At}.
 // item: the Queue record id (stored in the lock and named in the clear
 // command).
 export async function claimItem({ owner, get, patch, save, lock, item }) {
@@ -185,11 +190,11 @@ export async function claimItem({ owner, get, patch, save, lock, item }) {
  }
  let keep = false;
  const stamp = () => new Date((lock.now ?? Date.now)()).toISOString();
- const guardedPatch = async (fields, step, prev) => {
-  // Record when this PATCH starts BEFORE sending it, on the server clock (the
-  // Date of the GET just before it, prev). If that fails, nothing is sent
-  // and the lock is released normally.
-  lock.mark?.({ state: 'patching', step, patchStartedAt: stamp(), patchServerStart: serverIso(prev, `the ${step} PATCH`) });
+ const guardedPatch = async (fields, step, expect) => {
+  // Record (and fsync) this PATCH's exact fields and expected record values
+  // BEFORE sending it. If that fails, nothing is sent and the lock is
+  // released normally.
+  lock.mark?.({ state: 'patching', step, patch: fields, expect, patchStartedAt: stamp() });
   try { return await patch(fields); }
   catch (e) {
    if (definitePatchFailure(e)) throw e;
@@ -201,13 +206,13 @@ export async function claimItem({ owner, get, patch, save, lock, item }) {
  try {
   const r = await get();
   if (r.fields.Status !== 'Ready' || r.fields['Claimed By']) return { action: 'skip', status: r.fields.Status, claimed: !!r.fields['Claimed By'] };
-  // Server-clock acquisition stamp, before any PATCH: a lock left in state
-  // 'claiming' is measured from it (and must still read Ready/unclaimed).
-  lock.mark?.({ acquiredServerAt: serverIso(r, 'the owner PATCH') });
-  await guardedPatch({ 'Claimed By': owner, 'Claimed At': new Date().toISOString() }, 'owner', r);
+  // Whole seconds, so the value survives any sub-second normalization by the
+  // store and still compares equal in clearAmbiguousLock.
+  const claim = { 'Claimed By': owner, 'Claimed At': new Date(Math.floor((lock.now ?? Date.now)() / 1000) * 1000).toISOString() };
+  await guardedPatch(claim, 'owner', { ...claim });
   const rb = await get();
   if (rb.fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
-  await guardedPatch({ Status: 'Doing' }, 'doing', rb);
+  await guardedPatch({ Status: 'Doing' }, 'doing', { Status: 'Doing', ...claim });
   save(owner);
   return { action: 'claimed', owner };
  } catch (e) {

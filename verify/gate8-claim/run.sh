@@ -71,7 +71,7 @@ else
 			else verdict="FAIL (expected pass; java rc=$rc)"; tlc_fail=1; tail -30 "$tlc_out"; fi
 		else
 			if [ $rc -ne 0 ] && [ -n "$inv" ] && grep -q "Invariant $inv is violated" "$tlc_out"; then verdict="ok ($inv violated, as expected)"
-				case "$name" in Mutant-NoLock|Mutant-ReleaseOnAmbiguous|Mutant-ClearNoWait) true ;; *) false ;; esac && { echo "     shortest TLC trace (BFS):"; grep -E "^State [0-9]+:|^/\\\\ (pc|owner|claimed|status|lock|pendOwner|clears) " "$tlc_out" | sed 's/^/       /'; }
+				case "$name" in Mutant-NoLock|Mutant-ReleaseOnAmbiguous|Mutant-ClearMismatch|Mutant-ForceAcceptRisk) true ;; *) false ;; esac && { echo "     shortest TLC trace (BFS):"; grep -E "^State [0-9]+:|^/\\\\ (pc|owner|claimed|status|lock|pendOwner|pendDoing|rec|clears) " "$tlc_out" | sed 's/^/       /'; }
 			else verdict="FAIL (expected 'Invariant $inv is violated'; java rc=$rc)"; tlc_fail=1; tail -30 "$tlc_out"; fi
 		fi
 		echo "-- $name [expect $expect${inv:+ $inv}]: $verdict"

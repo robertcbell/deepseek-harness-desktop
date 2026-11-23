@@ -22,7 +22,7 @@
  * scripts/gate8/claim.mjs under fileClaimLock(root+'/gate8-claim.lock'). The
  * server then answers in arrival order (the scripted order cannot happen
  * once B is refused by the lock). It also adds the operator command
- * `clear-ambiguous <item>` (clearAmbiguousLock under the same lock path) as
+ * `clear-ambiguous <item> [--force-accept-risk]` (clearAmbiguousLock under the same lock path) as
  * a new branch, and runs it once after both claims: with no lock left it must
  * answer "no-lock". Exit 0 = exactly one process claimed, the other skipped
  * and clear-ambiguous answered; 1 otherwise.
@@ -66,19 +66,11 @@ if (adopt) {
   const out=await claimItem({owner,get,patch,item:s.recordId,lock:fileClaimLock(root+'/gate8-claim.lock'),save:o=>{s.owner=o;save(s);}});
   if(out.action!=='claimed'){console.log(JSON.stringify(out));process.exit(0);}`);
 	sub(`}else if(cmd==='checkpoint'){`, `}else if(cmd==='clear-ambiguous'){
-  if(process.argv[3]!==s.recordId)throw Error('clear-ambiguous requires the item record id');
+  if(process.argv[3]!==s.recordId||(process.argv[4]&&process.argv[4]!=='--force-accept-risk'))throw Error('usage: clear-ambiguous <item record id> [--force-accept-risk]');
   const {clearAmbiguousLock,fileClaimLock}=await import(${JSON.stringify(claimUrl)});
-  const out=await clearAmbiguousLock({lock:fileClaimLock(root+'/gate8-claim.lock'),item:s.recordId,get});
+  const out=await clearAmbiguousLock({lock:fileClaimLock(root+'/gate8-claim.lock'),item:s.recordId,get,forceAcceptRisk:process.argv[4]==='--force-accept-risk'});
   console.log(JSON.stringify(out));if(out.action==='refused')process.exitCode=3;
  }else if(cmd==='checkpoint'){`);
-}
-if (adopt) {
-	// Adoption also needs the reads to carry Airtable's Date header as serverDate
-	// (the same change as scripts/gate8/airtable-api.mjs).
-	const apiFile = path.join(code, 'gate8-airtable-api.mjs'); let api = fs.readFileSync(apiFile, 'utf8');
-	const from = `const value=await response.json();`;
-	if (api.split(from).length !== 2) { console.error('airtable-api rewrite anchor not unique'); process.exit(2); }
-	fs.writeFileSync(apiFile, api.replace(from, `${from}if(method==='GET'&&value&&typeof value==='object'){const date=response.headers?.get?.('date');if(date)value.serverDate=date;}`));
 }
 fs.writeFileSync(path.join(code, 'gate8-queue.mjs'), src);
 fs.writeFileSync(path.join(code, 'stub-claim.mjs'), 'export function writeClaim(){}\n');
