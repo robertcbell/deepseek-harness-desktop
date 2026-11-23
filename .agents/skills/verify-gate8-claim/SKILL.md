@@ -94,7 +94,7 @@ Node v26.13.1. TLC2 2026.11.19.180144 (rev bc1b506), Eclipse Adoptium 21.0.13.1 
 
 ## Last checked
 
-Last-checked commit `c03cf0a` (previous `f4c5feb`, independent review NOT-READY: ambiguous-PATCH release and leaked lock on write failure). Covered-file hashes:
+Last-checked commit `5447598` (previous `c03cf0a`: review blocker "remove the lock" advice was unsafe, replaced by `clear-ambiguous`; before that `f4c5feb`, NOT-READY: ambiguous-PATCH release and leaked lock on write failure). Covered-file hashes:
 
 - sha256 9663142ad4359a69dffdd6f5da3472fb3776c392ec18a967092c25dd184c887d `scripts/gate8/claim.mjs`
 
