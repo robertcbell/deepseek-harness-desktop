@@ -7,8 +7,14 @@
  * action:"claimed", and once it has, the record keeps that owner.
  *
  * Every Queue request (GET / PATCH) is a deferred step the explorer releases
- * in a chosen order; a PATCH step may also be released as "applied, response
- * lost" or "not applied, request failed" in fault scenarios. The lock is the
+ * in a chosen order. In fault scenarios a PATCH may instead end as:
+ *   - applied, response lost (ambiguous error, already applied);
+ *   - timed out, applied LATER (ambiguous error now; the delayed commit is a
+ *     separate step the explorer may schedule after any later step);
+ *   - timed out, never applied (ambiguous error);
+ *   - HTTP 422 rejected (definite failure, not applied).
+ * Extra check: a lock file is left behind only after an ambiguous PATCH
+ * (no leaked lock after a clean or definite outcome). The lock is the
  * real O_EXCL file lock in a fresh temp directory per schedule. Between
  * choices all microtasks drain, so one choice = one atomic step of the real
  * code between two awaits. DFS enumerates every choice sequence; the shortest
@@ -35,7 +41,9 @@ const SCENARIOS = {
 	// Two scheduled sessions claim the same Ready item.
 	'claim-x2': { actors: 2, faults: false, saveFails: [] },
 	// Same, every PATCH may also be lost-after-apply or fail-before-apply.
-	'claim-x2-faults': { actors: 2, faults: true, saveFails: [] },
+	'claim-x2-faults': { actors: 2, faults: true, noDelayed: true, saveFails: [] },
+	// Every PATCH may also time out and land later (the reviewed blocker).
+	'claim-x2-delayed': { actors: 2, faults: true, saveFails: [] },
 	// First claimer's local state save throws after both PATCHes landed.
 	'claim-x2-savefail': { actors: 2, faults: false, saveFails: [1] },
 	'claim-x3': { actors: 3, faults: false, saveFails: [] },
@@ -54,24 +62,34 @@ async function execute(sc, prefix) {
 	const record = { fields: { Status: 'Ready', 'Claimed By': '' } };
 	const ops = []; const log = []; const choices = [];
 	const winners = []; let violationAt = -1;
-	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0 };
+	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0 };
+	let ambiguousSeen = false;
 	const show = () => `{Status:${record.fields.Status}, Claimed By:${record.fields['Claimed By'] || '(none)'}}`;
 	const check = () => {
 		if (violationAt >= 0) return;
 		const bad = winners.length > 1 || winners.some(w => record.fields['Claimed By'] !== w);
 		if (bad) violationAt = log.length;
 	};
+	const ambiguous = msg => Object.assign(Error(msg), { code: 'ETIMEDOUT' });
 	const store = who => ({
 		get: () => new Promise(resolve => ops.push({ label: `${who} GET -> `, fire: () => { const v = structuredClone(record); resolve(v); return show(); } })),
 		patch: fields => new Promise((resolve, reject) => {
 			const shown = Object.fromEntries(Object.entries(fields).filter(([k]) => k !== 'Claimed At'));
 			const apply = () => Object.assign(record.fields, fields);
-			ops.push({ label: `${who} PATCH ${JSON.stringify(shown)} -> `, fire: () => { apply(); resolve(structuredClone(record)); return show(); } });
+			const p = `${who} PATCH ${JSON.stringify(shown)}`;
+			const group = {};
+			const alts = [{ label: `${p} -> `, fire: () => { apply(); resolve(structuredClone(record)); return show(); } }];
 			if (sc.faults) {
-				ops.push({ group: ops.at(-1), label: `${who} PATCH ${JSON.stringify(shown)} applied, response LOST -> `, fire: () => { apply(); ev.lostResponse++; reject(Error('response lost')); return show(); } });
-				ops.push({ group: ops.at(-2), label: `${who} PATCH ${JSON.stringify(shown)} FAILED, not applied -> `, fire: () => { ev.failedPatch++; reject(Error('request failed')); return show(); } });
-				ops.at(-3).group = ops.at(-3);
+				alts.push({ label: `${p} applied, response LOST (timeout) -> `, fire: () => { apply(); ev.lostResponse++; ambiguousSeen = true; reject(ambiguous('response lost')); return show(); } });
+				alts.push({ label: `${p} REJECTED HTTP 422, not applied -> `, fire: () => { ev.failedPatch++; reject(Object.assign(Error('HTTP 422'), { httpStatus: 422 })); return show(); } });
+				alts.push({ label: `${p} TIMED OUT, never applied -> `, fire: () => { ambiguousSeen = true; reject(ambiguous('timeout')); return show(); } });
+				if (!sc.noDelayed) alts.push({ label: `${p} TIMED OUT (request still in flight) -> `, fire: () => {
+					ambiguousSeen = true; reject(ambiguous('timeout'));
+					ops.push({ label: `${who}'s delayed PATCH ${JSON.stringify(shown)} is applied by the store -> `, fire: () => { apply(); ev.delayedLanded++; return show(); } });
+					return show();
+				} });
 			}
+			for (const a of alts) ops.push({ ...a, group });
 		}),
 	});
 	for (let i = 1; i <= sc.actors; i++) {
@@ -81,6 +99,7 @@ async function execute(sc, prefix) {
 			claimItem({ owner, get: s.get, patch: s.patch, lock, save: () => { if (sc.saveFails.includes(i)) throw Error('state save failed'); } })
 				.then(out => {
 					if (out.action === 'claimed') { ev.claimed++; winners.push(owner); log.push(`${who} returns action:"claimed"`); check(); }
+					else if (out.action === 'needs-operator') { ev.needsOperator++; log.push(`${who} returns needs-operator (lock kept: ${out.reason})`); }
 					else { if (out.reason === 'claim-lock-held') ev.skipLock++; else ev.skipStatus++; log.push(`${who} returns skip (${out.reason ?? 'status ' + out.status + ', claimed=' + out.claimed})`); }
 				}, e => { ev.threw++; log.push(`${who} throws: ${e.message}`); });
 			return `lock.acquire() returned ${acquired.get(owner)}`;
@@ -100,12 +119,17 @@ async function execute(sc, prefix) {
 		if (++step > 200) throw Error('step bound exceeded');
 	}
 	await drain();
+	if (real.holder() !== null) {
+		ev.keptLock++;
+		// A lock may outlive the run only after an ambiguous PATCH (kept on purpose).
+		if (!ambiguousSeen && violationAt < 0) { log.push(`LEAK: lock file left behind without any ambiguous PATCH (holder ${JSON.stringify(real.holder())})`); violationAt = log.length; }
+	}
 	return { choices, log, violationAt, ev };
 }
 
 async function explore(sc) {
 	let prefix = [], schedules = 0, shortest = null, maxDepth = 0;
-	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0 };
+	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0 };
 	for (;;) {
 		const r = await execute(sc, prefix); schedules++;
 		maxDepth = Math.max(maxDepth, r.choices.length);
@@ -126,11 +150,12 @@ for (const name of names) {
 	const sc = SCENARIOS[name];
 	if (!sc) { console.error(`unknown scenario ${name}`); process.exit(2); }
 	const res = await explore(sc);
-	const want = { claimed: true, skipLock: true, skipStatus: true, lostResponse: sc.faults, failedPatch: sc.faults, threw: sc.faults || sc.saveFails.length > 0 };
+	const want = { claimed: true, skipLock: true, skipStatus: true, lostResponse: sc.faults, failedPatch: sc.faults, threw: sc.faults || sc.saveFails.length > 0,
+		delayedLanded: sc.faults && !sc.noDelayed, needsOperator: sc.faults, keptLock: sc.faults };
 	const vacuous = Object.entries(want).filter(([k, w]) => w && res.reached[k] === 0).map(([k]) => k);
 	const bad = res.shortest !== null || res.truncated || vacuous.length > 0;
 	failed ||= bad;
-	console.log(`\n== scenario ${name} (${sc.actors} claimers${sc.faults ? ', PATCH faults' : ''}${sc.saveFails.length ? ', save fails for claimer ' + sc.saveFails : ''})`);
+	console.log(`\n== scenario ${name} (${sc.actors} claimers${sc.faults ? (sc.noDelayed ? ', PATCH faults' : ', PATCH faults incl. delayed commit') : ''}${sc.saveFails.length ? ', save fails for claimer ' + sc.saveFails : ''})`);
 	console.log(`   schedules explored: ${res.schedules}${res.truncated ? ' (TRUNCATED at bound)' : ' (exhaustive)'}; max steps per schedule: ${res.maxDepth}`);
 	console.log(`   witnesses (schedules reaching each event): ${JSON.stringify(res.reached)}`);
 	if (vacuous.length) console.log(`   VACUITY: expected events never reached: ${vacuous.join(', ')}`);

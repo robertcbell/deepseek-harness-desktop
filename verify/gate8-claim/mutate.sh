@@ -38,8 +38,7 @@ open(f,'w').write(s)
 }
 
 # M1: no lock (= the original helper: GET check, PATCH owner, readback, PATCH Doing).
-mutant M1-no-lock claim-x2 "sub('''   try { fd = fs.openSync(lockPath, 'wx', 0o600); }''', '''   return true;
-   try { fd = fs.openSync(lockPath, 'wx', 0o600); }''')"
+mutant M1-no-lock claim-x2 "sub('''   try { fs.linkSync(tmp, lockPath); return true; }''', '''   try { fs.rmSync(tmp, { force: true }); return true; }''')"
 
 # M2: lock kept, Ready/unclaimed check removed: a later claimer overwrites the owner.
 mutant M2-no-status-check claim-x2 "sub('''  if (r.fields.Status !== 'Ready' || r.fields['Claimed By']) return''', '''  if (false) return''')"
@@ -54,8 +53,24 @@ mutant M3-early-release claim-x2 "sub('''  const r = await get();
 # bounds: under the lock no other claimer can write between PATCH and
 # readback. The readback only guards writers outside the lock (another host,
 # a human edit), which this check does not model. Expected to survive.
-mutant M4-no-readback claim-x2-faults "sub('''  if ((await get()).fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
+mutant M4-no-readback claim-x2-delayed "sub('''  if ((await get()).fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
 ''', '')" survives
+
+# M5: release the lock after ANY PATCH error (= 8b51cb5, review blocker 1):
+# a timed-out PATCH lands after the next claimer took the item.
+mutant M5-release-on-ambiguous claim-x2-delayed "sub('''   if (definitePatchFailure(e)) throw e;
+''', '''   throw e;
+''')"
+
+# M6: treat timeouts/network errors as definite (only 5xx stays ambiguous):
+# a timeout releases the lock and its PATCH lands later.
+mutant M6-timeout-as-definite claim-x2-delayed "sub('''export const definitePatchFailure = e => Number.isInteger(e?.httpStatus) && e.httpStatus >= 400 && e.httpStatus <= 499;''', '''export const definitePatchFailure = e => !(Number.isInteger(e?.httpStatus) && e.httpStatus >= 500);''')"
+
+# M7: keep the lock after every PATCH error, including a definite HTTP 422.
+# Safe for one-owner, but it leaves a lock with no ambiguity; the explorer's
+# lock check (LEAK) must catch it.
+mutant M7-keep-on-definite claim-x2-faults "sub('''   if (definitePatchFailure(e)) throw e;
+   keep = true;''', '''   keep = true;''')"
 
 echo "### baseline (unmutated scripts/gate8/claim.mjs)"
 node "$here/explore.mjs" --lib "$root/scripts/gate8"; rc=$?

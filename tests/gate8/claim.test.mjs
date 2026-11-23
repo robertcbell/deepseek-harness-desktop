@@ -84,12 +84,71 @@ test('a single claim succeeds and releases the lock; a held lock makes claim ski
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
 });
 
-test('ambiguous PATCH and readback mismatch throw, release the lock and never report claimed', async () => {
- const dir = tmp(); const lockPath = path.join(dir, 'l');
+const ready = () => ({fields: {Status: 'Ready', 'Claimed By': ''}});
+// What fetch with AbortSignal.timeout throws in scripts/gate8/airtable-api.mjs.
+const timeoutError = () => new DOMException('deadline', 'TimeoutError');
+
+test('review blocker 1: a timed-out PATCH that lands later cannot give a second claimer ownership', async () => {
+ // Shared last-writer-wins record. A's owner PATCH times out but is applied
+ // after B's claim would otherwise have completed.
+ const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
  try {
-  await assert.rejects(claimItem({owner: 'o1', lock: fileClaimLock(lockPath), get: async () => ({fields: {Status: 'Ready', 'Claimed By': ''}}), patch: async () => { throw Error('response lost'); }, save: () => assert.fail('no save')}), /response lost/);
-  assert.equal(fs.existsSync(lockPath), false);
+  const record = ready(); let delayed = null;
+  const get = async () => structuredClone(record);
+  const patchFor = who => async fields => {
+   if (who === 'A' && fields['Claimed By']) { delayed = () => Object.assign(record.fields, fields); throw timeoutError(); }
+   Object.assign(record.fields, fields); return structuredClone(record);
+  };
+  const a = await claimItem({owner: 'A', lock: fileClaimLock(lockPath), get, patch: patchFor('A'), save: () => assert.fail('A must not save')});
+  assert.equal(a.action, 'needs-operator'); assert.equal(a.lockPath, lockPath); assert.match(a.message, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(fs.existsSync(lockPath), true, 'ambiguous PATCH keeps the lock');
+  assert.equal(fileClaimLock(lockPath).holder().state, 'ambiguous');
+  const b = await claimItem({owner: 'B', lock: fileClaimLock(lockPath), get, patch: patchFor('B'), save: () => assert.fail('B must not save')});
+  assert.equal(b.action, 'skip'); assert.equal(b.reason, 'claim-lock-held'); assert.equal(b.lockPath, lockPath);
+  assert.match(b.message, /ambiguous/); assert.ok(b.message.includes(lockPath), 'skip message names the lock path to remove');
+  delayed();
+  assert.equal(record.fields['Claimed By'], 'A'); assert.equal(record.fields.Status, 'Ready');
+ } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('network errors and HTTP 5xx are ambiguous (lock kept); only HTTP 4xx releases', async () => {
+ const dir = tmp();
+ try {
+  const cases = [[timeoutError(), 'needs-operator', true], [Object.assign(Error('fetch failed'), {cause: {code: 'ECONNRESET'}}), 'needs-operator', true],
+   [Object.assign(Error('Airtable PATCH: HTTP 503'), {httpStatus: 503}), 'needs-operator', true], [Object.assign(Error('Airtable PATCH: HTTP 422'), {httpStatus: 422}), 'throws', false]];
+  for (const [n, [err, want, kept]] of cases.entries()) for (const step of ['owner', 'doing']) {
+   const lockPath = path.join(dir, `l-${n}-${step}`);
+   const run = claimItem({owner: 'o', lock: fileClaimLock(lockPath), get: (() => { let n = 0; return async () => ({fields: {Status: 'Ready', 'Claimed By': n++ ? 'o' : ''}}); })(),
+    patch: (() => { let k = 0; return async () => { k++; if ((step === 'owner' && k === 1) || (step === 'doing' && k === 2)) throw err; return {}; }; })(), save: () => assert.fail('no save')});
+   if (want === 'throws') await assert.rejects(run, /HTTP 422/);
+   else assert.equal((await run).action, want);
+   assert.equal(fs.existsSync(lockPath), kept, `${err.message} at ${step}`);
+  }
+  // Readback mismatch after a confirmed PATCH answer: release is allowed.
+  const lockPath = path.join(dir, 'l-readback');
   await assert.rejects(claimItem({owner: 'o1', lock: fileClaimLock(lockPath), get: (() => { let n = 0; return async () => ({fields: {Status: 'Ready', 'Claimed By': n++ ? 'someone-else' : ''}}); })(), patch: async () => ({}), save: () => assert.fail('no save')}), /readback mismatch/);
   assert.equal(fs.existsSync(lockPath), false);
  } finally { fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('review blocker 2: ENOSPC while writing lock metadata leaves no lock and no temp file', async () => {
+ // Inject through the real node:fs module (both write paths), so the test
+ // does not depend on how claim.mjs writes the metadata.
+ const dir = tmp(); const lockPath = path.join(dir, 'gate8-claim.lock');
+ const enospc = () => Object.assign(Error('ENOSPC: no space left on device, write'), {code: 'ENOSPC'});
+ const real = {writeSync: fs.writeSync, writeFileSync: fs.writeFileSync};
+ try {
+  fs.writeSync = () => { throw enospc(); };
+  fs.writeFileSync = (file, data, opts) => { real.writeFileSync(file, String(data).slice(0, 3), opts); throw enospc(); };
+  let rejected;
+  try { await claimItem({owner: 'o1', lock: fileClaimLock(lockPath), get: async () => assert.fail('no Queue read'), patch: async () => assert.fail('no Queue write'), save: () => assert.fail('no save')}); }
+  catch (e) { rejected = e; }
+  Object.assign(fs, real);
+  assert.equal(rejected?.code, 'ENOSPC');
+  assert.deepEqual(fs.readdirSync(dir), [], 'no lock and no temp file left behind');
+  // The next claimer is not blocked.
+  const record = ready();
+  const out = await claimItem({owner: 'o2', lock: fileClaimLock(lockPath), get: async () => structuredClone(record), patch: async f => Object.assign(record.fields, f), save() {}});
+  assert.equal(out.action, 'claimed'); assert.deepEqual(fs.readdirSync(dir), []);
+ } finally { Object.assign(fs, real); fs.rmSync(dir, {recursive: true, force: true}); }
 });
