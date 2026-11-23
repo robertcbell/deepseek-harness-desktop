@@ -23,13 +23,17 @@
  * Scenario claim-x2-clear adds the operator: one run of the REAL
  * clearAmbiguousLock (`gate8-queue.mjs clear-ambiguous`) as a step at any
  * point, its settle pause as a separate step (delayed PATCHes may land
- * between its two reads), and one virtual-clock step that advances time by
- * CLEAR_QUIESCENCE_MS. The clock step is enabled only when no delayed PATCH
- * is still in flight: that is the TIMING ASSUMPTION behind the window (no
- * PATCH is applied later than CLEAR_QUIESCENCE_MS after it started). The
- * explorer cannot check that assumption; it checks that, if it holds, a
- * clear never yields two owners. Mutant M8 (no window) shows what happens
- * without it.
+ * between its two reads), and one SERVER-clock step that advances Airtable's
+ * clock (the Date header every GET carries as serverDate) by
+ * CLEAR_QUIESCENCE_MS. The server-clock step is enabled only when no PATCH is
+ * in flight (sent and not yet answered, or timed out and not yet applied): that is the TIMING ASSUMPTION behind the window
+ * (no PATCH is applied later than CLEAR_QUIESCENCE_MS of Airtable time after
+ * it started). The explorer cannot check that assumption; it checks that, if
+ * it holds, a clear never yields two owners. A separate, always-enabled step
+ * jumps the LOCAL wall clock (the lock's now()) forward by
+ * CLEAR_QUIESCENCE_MS at any point (review attack "clock-forward"). Mutant
+ * M8 (no window) and M10 (window on the local clock) show what happens
+ * without the server-clock window.
  *
  * Usage: node explore.mjs [--lib <dir with claim.mjs>] [--scenario <name>|all]
  * Exit 0 = rule held in every schedule AND witnesses reached; 1 = violation,
@@ -70,8 +74,9 @@ let runNo = 0;
 
 async function execute(sc, prefix) {
 	const lockDir = path.join(tmpRoot, String(runNo++)); fs.mkdirSync(lockDir);
-	const clock = { t: Date.parse('2026-11-22T10:00:00Z') };
-	const real = fileClaimLock(path.join(lockDir, 'gate8-claim.lock'), { now: () => clock.t });
+	const clock = { t: Date.parse('2026-11-22T10:00:00Z') }; // Airtable's clock (Date header)
+	const local = { t: clock.t }; // this host's wall clock (lock now())
+	const real = fileClaimLock(path.join(lockDir, 'gate8-claim.lock'), { now: () => local.t });
 	const acquired = new Map(); // owner -> what the real acquire() returned (observation only)
 	const lock = { ...real, acquire: o => { const v = real.acquire(o); acquired.set(o, v); return v; } };
 	const record = { fields: { Status: 'Ready', 'Claimed By': '' } };
@@ -79,7 +84,9 @@ async function execute(sc, prefix) {
 	const winners = []; let violationAt = -1;
 	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, claimAfterClear: 0 };
 	let clearedOnce = false;
-	const delayedPending = () => ops.some(o => o.delayed);
+	// A PATCH is in flight from the moment the claimer sends it (its op is
+	// queued) until it is answered/applied, including a timed-out delayed one.
+	const patchInFlight = () => ops.some(o => o.delayed || o.patch);
 	let ambiguousSeen = false;
 	const show = () => `{Status:${record.fields.Status}, Claimed By:${record.fields['Claimed By'] || '(none)'}}`;
 	const check = () => {
@@ -89,7 +96,7 @@ async function execute(sc, prefix) {
 	};
 	const ambiguous = msg => Object.assign(Error(msg), { code: 'ETIMEDOUT' });
 	const store = who => ({
-		get: () => new Promise(resolve => ops.push({ label: `${who} GET -> `, fire: () => { const v = structuredClone(record); resolve(v); return show(); } })),
+		get: () => new Promise(resolve => ops.push({ label: `${who} GET -> `, fire: () => { const v = { ...structuredClone(record), serverDate: new Date(clock.t).toUTCString() }; resolve(v); return show(); } })),
 		patch: fields => new Promise((resolve, reject) => {
 			const shown = Object.fromEntries(Object.entries(fields).filter(([k]) => k !== 'Claimed At'));
 			const apply = () => Object.assign(record.fields, fields);
@@ -106,7 +113,7 @@ async function execute(sc, prefix) {
 					return show();
 				} });
 			}
-			for (const a of alts) ops.push({ ...a, group });
+			for (const a of alts) ops.push({ ...a, group, patch: true });
 		}),
 	});
 	for (let i = 1; i <= sc.actors; i++) {
@@ -123,12 +130,14 @@ async function execute(sc, prefix) {
 		} });
 	}
 	if (sc.clear) {
-		ops.push({ label: `clock advances CLEAR_QUIESCENCE_MS (${CLEAR_QUIESCENCE_MS / 60000} min; assumption: no PATCH still in flight) -> `,
-			enabled: () => !delayedPending(), fire: () => { clock.t += CLEAR_QUIESCENCE_MS; return `now ${new Date(clock.t).toISOString()}`; } });
+		ops.push({ label: `Airtable's clock advances CLEAR_QUIESCENCE_MS (${CLEAR_QUIESCENCE_MS / 60000} min; assumption: no PATCH still in flight) -> `,
+			enabled: () => !patchInFlight(), fire: () => { clock.t += CLEAR_QUIESCENCE_MS; return `server now ${new Date(clock.t).toISOString()}`; } });
+		ops.push({ label: `LOCAL wall clock jumps forward ${CLEAR_QUIESCENCE_MS / 60000} min (Airtable's clock unchanged) -> `,
+			fire: () => { local.t += CLEAR_QUIESCENCE_MS; return `local now ${new Date(local.t).toISOString()}`; } });
 		ops.push({ label: 'operator runs gate8-queue.mjs clear-ambiguous -> ', fire: () => {
 			const s = store('operator');
 			const pause = () => new Promise(resolve => ops.push({ label: 'operator settle pause between the two reads ends -> ', fire: () => { resolve(); return show(); } }));
-			clearAmbiguousLock({ lock: real, item: undefined, get: s.get, pause, now: () => clock.t })
+			clearAmbiguousLock({ lock: real, item: undefined, get: s.get, pause })
 				.then(out => {
 					if (out.action === 'cleared') { ev.cleared++; clearedOnce = true; log.push(`operator clear: cleared (patchLanded=${out.patchLanded})`); }
 					else { if (out.action === 'refused') ev.clearRefused++; log.push(`operator clear: ${out.action}${out.reason ? ' (' + out.reason + ')' : ''}`); }

@@ -61,7 +61,7 @@ $NO_MARK"
 # bounds: under the lock no other claimer can write between PATCH and
 # readback. The readback only guards writers outside the lock (another host,
 # a human edit), which this check does not model. Expected to survive.
-mutant M4-no-readback claim-x2-delayed "sub('''  if ((await get()).fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
+mutant M4-no-readback claim-x2-delayed "sub('''  if (rb.fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
 ''', '')" survives
 
 # M5: release the lock after ANY PATCH error (= 8b51cb5, review blocker 1):
@@ -83,14 +83,22 @@ mutant M7-keep-on-definite claim-x2-faults "sub('''   if (definitePatchFailure(e
 # M8: clear-ambiguous without the quiescence window (= the old advice:
 # remove the lock once no claimer is running). A delayed PATCH lands after the
 # clear and overwrites the next claimer (the reviewer's loopback reproduction).
-mutant M8-clear-no-window claim-x2-clear "sub('''  if (waited < quiescenceMs) return''', '''  if (false) return''')"
+mutant M8-clear-no-window claim-x2-clear "sub('''  if (n1 - start < quiescenceMs) return''', '''  if (false) return''')
+sub('''  if (n2 - start < quiescenceMs) return''', '''  if (false) return''')"
 
 # M9: clear-ambiguous without the second (settle) read. EQUIVALENT under the
 # explorer's timing assumption (no PATCH is in flight once the window has
 # passed), so it is expected to survive. The double read is defence in depth
 # for a store that breaks that assumption; tests/gate8/claim.test.mjs covers
 # it directly ("a PATCH landing between the two settle reads is detected").
-mutant M9-clear-single-read claim-x2-clear "sub('''  const r1 = await get(); await pause(settleMs); const r2 = await get();''', '''  const r2 = await get(); const r1 = r2;''')" survives
+mutant M9-clear-single-read claim-x2-clear "sub('''  await pause(settleMs);
+  const r2 = await get(); const n2 = serverTime(r2);''', '''  const r2 = r1; const n2 = n1;''')" survives
+
+# M10: measure the clear window on the LOCAL clock (= 0ad0135, review
+# blocker "clock-forward"): a forward local-clock jump opens the window while
+# A's PATCH is still in flight.
+mutant M10-clear-local-clock claim-x2-clear "sub('''  const r1 = await get(); const n1 = serverTime(r1);''', '''  const r1 = await get(); const n1 = lock.now();''')
+sub('''  const r2 = await get(); const n2 = serverTime(r2);''', '''  const r2 = await get(); const n2 = lock.now();''')"
 
 echo "### baseline (unmutated scripts/gate8/claim.mjs)"
 node "$here/explore.mjs" --lib "$root/scripts/gate8"; rc=$?

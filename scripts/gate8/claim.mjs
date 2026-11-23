@@ -15,8 +15,9 @@ import fs from 'node:fs';
 // (link fails with EEXIST if the lock exists). A failed metadata write
 // therefore never leaves a lock behind.
 //
-// now() is the wall clock used for every timestamp in the lock (injectable for
-// the explorer and tests).
+// now() is the local wall clock used for the informational local timestamps in
+// the lock (injectable for the explorer and tests). The clear window never
+// uses it: it uses the server-clock fields acquiredServerAt/patchServerStart.
 export function fileClaimLock(lockPath, { now = Date.now } = {}) {
  let seq = 0;
  const iso = () => new Date(now()).toISOString();
@@ -63,44 +64,68 @@ export const definitePatchFailure = e => Number.isInteger(e?.httpStatus) && e.ht
 // on a loopback server). The only supported way to clear the lock is
 // `node gate8-queue.mjs clear-ambiguous <item>`, which calls clearAmbiguousLock.
 //
-// CLEAR_QUIESCENCE_MS: how long after the last PATCH the claimer STARTED (the
-// lock records patchStartedAt before every PATCH is sent) a clear is refused.
-// Rationale: the client aborts every Airtable request after
+// CLEAR_QUIESCENCE_MS: how long after the last PATCH the claimer STARTED a
+// clear is refused. The window is measured on AIRTABLE'S clock, never the
+// local one: just before every PATCH the lock records patchServerStart, the
+// HTTP Date header of the GET that immediately preceded it, and the clear
+// compares that with the Date header of its own reads. A local wall-clock
+// jump (NTP step, manual change) therefore cannot shorten the window.
+// Rationale for 10 min: the client aborts every Airtable request after
 // ownershipReadPolicy.deadlineMs (20 s, scripts/gate8/retry-read.mjs) and a
 // dead process closes its socket, so no request bytes leave the host more
-// than ~20 s after patchStartedAt. Airtable documents no server-side request
-// lifetime; 10 minutes is a conservative bound, 30x the client deadline, on
-// how long an already-received PATCH could still be applied. This is a
-// TIMING ASSUMPTION, not a guarantee: a store that applies a request later
-// than this could still overwrite a later claimer. The two identical reads
-// below are a second, independent check for that case.
+// than ~20 s after the PATCH started. Airtable documents no server-side
+// request lifetime; 10 minutes is a conservative bound, 30x the client
+// deadline, on how long an already-received PATCH could still be applied.
+// This is a TIMING ASSUMPTION, not a guarantee. It also assumes the step from
+// the preceding GET's answer to the PATCH leaving the host is short (one
+// local lock write; a host suspend exactly there eats into the margin), that
+// Airtable's clock does not step backwards by minutes, and it accepts the
+// Date header's 1 s resolution. The two identical reads below are a second,
+// independent check.
 export const CLEAR_QUIESCENCE_MS = 10 * 60 * 1000;
 // Gap between the two record reads that must be identical before clearing.
 export const CLEAR_SETTLE_MS = 5000;
 
+// Server time of a Queue read: get() must return the record with
+// `serverDate`, the response's HTTP Date header (scripts/gate8/airtable-api.mjs
+// attaches it). NaN when missing or unparseable.
+export const serverTime = r => typeof r?.serverDate === 'string' ? Date.parse(r.serverDate) : NaN;
+const serverIso = (r, what) => {
+ const t = serverTime(r);
+ if (!Number.isFinite(t)) throw Object.assign(Error(`The Queue read before ${what} carried no parseable server Date header; nothing was sent (the clear window is measured on Airtable's clock).`), { code: 'ENOSERVERTIME' });
+ return new Date(t).toISOString();
+};
+
 const clearCommand = item => `node gate8-queue.mjs clear-ambiguous ${item ?? '<item>'}`;
-const operatorAction = item => `Do not delete the lock file: a timed-out PATCH can still land. Run \`${clearCommand(item)}\`; it refuses until ${CLEAR_QUIESCENCE_MS / 60000} minutes after the last PATCH started and the record reads the same twice.`;
+const operatorAction = item => `Do not delete the lock file: a timed-out PATCH can still land. Run \`${clearCommand(item)}\`; it refuses until Airtable's clock shows ${CLEAR_QUIESCENCE_MS / 60000} minutes since the last PATCH started and the record reads the same twice.`;
 const stableJson = v => JSON.stringify(v, (k, x) => x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map(key => [key, x[key]])) : x);
 const pidAlive = pid => { if (!Number.isInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const preClaim = r => r?.fields?.Status === 'Ready' && !r?.fields?.['Claimed By'];
 
 // clearAmbiguousLock({lock, item, get}): remove a claim lock left by an
 // ambiguous PATCH (state 'ambiguous') or by a dead claimer, only when no
 // claim PATCH can still land:
 //  1. the lock's state is 'ambiguous', or its holder process is dead
 //     (a live claimer's lock is never cleared);
-//  2. now - (latest time recorded in the lock, incl. patchStartedAt)
-//     >= quiescenceMs;
-//  3. two record reads, settleMs apart, are identical;
-//  4. the lock still has the content inspected in step 1.
-// Clears are serialized by a second O_EXCL file `<lock>.clear`. Returns
-// {action:'cleared', patchLanded, record} or {action:'refused', reason, ...};
-// a refusal never removes the lock.
-export async function clearAmbiguousLock({ lock, item, get, now = lock.now ?? Date.now, pause = ms => new Promise(r => setTimeout(r, ms)),
+//  2. the lock records a server-clock start: patchServerStart for any lock
+//     that may have sent a PATCH, or, for a lock still in state 'claiming'
+//     with no PATCH recorded, acquiredServerAt. Missing or unparseable ->
+//     refused: such a lock (e.g. one written by an older claim.mjs, which
+//     kept only local-clock times) is never cleared by this command;
+//  3. both record reads carry a server Date and serverNow - start >=
+//     quiescenceMs on each;
+//  4. the two reads, settleMs apart, are identical; for a 'claiming' lock
+//     both must also still show the pre-claim state (Ready, unclaimed);
+//  5. the lock still has the content inspected in step 1.
+// The local clock is never used for the window. Clears are serialized by a
+// second O_EXCL file `<lock>.clear`. Returns {action:'cleared', patchLanded,
+// record} or {action:'refused', reason, ...}; a refusal never removes the lock.
+export async function clearAmbiguousLock({ lock, item, get, pause = ms => new Promise(r => setTimeout(r, ms)),
  quiescenceMs = CLEAR_QUIESCENCE_MS, settleMs = CLEAR_SETTLE_MS, isAlive = pidAlive }) {
  const refused = (reason, extra = {}) => ({ action: 'refused', reason, lockPath: lock.path, ...extra });
  const raw = () => { try { return fs.readFileSync(lock.path, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
  const mutex = `${lock.path}.clear`;
- try { fs.writeFileSync(mutex, JSON.stringify({ pid: process.pid, at: new Date(now()).toISOString() }), { flag: 'wx', mode: 0o600 }); }
+ try { fs.writeFileSync(mutex, JSON.stringify({ pid: process.pid }), { flag: 'wx', mode: 0o600 }); }
  catch (e) { if (e.code === 'EEXIST') return refused('clear-in-progress', { message: `Another clear holds ${mutex}; if no clear is running, that file may be removed (it guards only clears, never claims).` }); throw e; }
  try {
   const seen = raw();
@@ -108,14 +133,27 @@ export async function clearAmbiguousLock({ lock, item, get, now = lock.now ?? Da
   let h; try { h = JSON.parse(seen); } catch { return refused('lock-unreadable'); }
   if (h.item && item && h.item !== item) return refused('wrong-item', { holder: h, message: `The lock is for item ${h.item}, not ${item}.` });
   if (h.state !== 'ambiguous' && isAlive(h.pid)) return refused('claimer-running', { holder: h, message: `Claimer pid ${h.pid} is still running; wait for it to finish.` });
-  const times = [h.at, h.markedAt, h.patchStartedAt, h.ambiguousAt].map(t => Date.parse(t ?? '')).filter(Number.isFinite);
-  if (!times.length || ((h.state === 'ambiguous' || h.state === 'patching') && !Number.isFinite(Date.parse(h.patchStartedAt ?? '')))) return refused('no-patch-start-time', { holder: h });
-  const since = Math.max(...times), waited = now() - since;
-  if (waited < quiescenceMs) return refused('quiescence-window', { holder: h, waitMs: quiescenceMs - waited,
-   message: `A claim PATCH may still land. Retry after ${new Date(since + quiescenceMs).toISOString()} (${Math.ceil((quiescenceMs - waited) / 1000)} s).` });
-  const r1 = await get(); await pause(settleMs); const r2 = await get();
+  // Any sign of a PATCH (a non-claiming state or a recorded start) means the
+  // window must run from the server-clock PATCH start.
+  const mayHavePatched = h.state !== 'claiming' || 'patchStartedAt' in h || 'patchServerStart' in h;
+  const start = Date.parse(mayHavePatched ? h.patchServerStart ?? '' : h.acquiredServerAt ?? '');
+  if (!Number.isFinite(start)) return refused('no-server-time-in-lock', { holder: h, message: mayHavePatched
+   ? 'The lock records no server-clock PATCH start (patchServerStart), so the time since the last PATCH started cannot be measured safely: its local-clock times may predate the PATCH or be skewed by a clock jump (such locks come only from an older claim.mjs). This command will not clear it; the lock is kept. Escalate to the Lead.'
+   : 'The lock is in the claiming state and records no server-clock acquisition time (acquiredServerAt), so it may come from an older claim.mjs that could have sent a PATCH without recording it. It is treated as ambiguous and not cleared by this command; the lock is kept. Escalate to the Lead.' });
+  const noServerTime = () => refused('no-server-time', { holder: h, message: 'A Queue read carried no parseable Date header, so the window cannot be measured on the server clock. Lock kept; retry later.' });
+  const tooEarly = n => refused('quiescence-window', { holder: h, waitMs: quiescenceMs - (n - start),
+   message: `A claim PATCH may still land. Retry after ${new Date(start + quiescenceMs).toISOString()} by Airtable's clock (${Math.ceil((quiescenceMs - (n - start)) / 1000)} s).` });
+  const r1 = await get(); const n1 = serverTime(r1);
+  if (!Number.isFinite(n1)) return noServerTime();
+  if (n1 - start < quiescenceMs) return tooEarly(n1);
+  await pause(settleMs);
+  const r2 = await get(); const n2 = serverTime(r2);
+  if (!Number.isFinite(n2)) return noServerTime();
+  if (n2 - start < quiescenceMs) return tooEarly(n2);
   if (stableJson(r1?.fields) !== stableJson(r2?.fields)) return refused('record-changing', { holder: h, first: r1?.fields, second: r2?.fields,
    message: 'The record changed between two reads; a PATCH may still be landing. Lock kept; retry later.' });
+  if (!mayHavePatched && !(preClaim(r1) && preClaim(r2))) return refused('not-pre-claim', { holder: h, record: r2?.fields,
+   message: 'The lock records no PATCH, but the record no longer shows its pre-claim state (Ready, unclaimed). Lock kept; escalate to the Lead.' });
   if (raw() !== seen) return refused('lock-changed', { message: 'The lock changed during the clear; nothing removed.' });
   fs.rmSync(lock.path);
   const f = r2.fields ?? {};
@@ -127,7 +165,8 @@ export async function clearAmbiguousLock({ lock, item, get, now = lock.now ?? Da
  } finally { fs.rmSync(mutex, { force: true }); }
 }
 
-// get(): current record; patch(fields): PATCH the record; save(owner): persist
+// get(): current record with `serverDate` (its HTTP Date header; a read
+// without one stops the claim before any PATCH); patch(fields): PATCH the record; save(owner): persist
 // local ownership. Returns {action:'claimed'} only while holding the lock.
 // The lock is released only when no claim PATCH can still land: after the
 // claim completes, after a skip/read failure, or after a definite (4xx)
@@ -146,10 +185,11 @@ export async function claimItem({ owner, get, patch, save, lock, item }) {
  }
  let keep = false;
  const stamp = () => new Date((lock.now ?? Date.now)()).toISOString();
- const guardedPatch = async (fields, step) => {
-  // Record when this PATCH starts BEFORE sending it; if that write fails,
-  // nothing is sent and the lock is released normally.
-  lock.mark?.({ state: 'patching', step, patchStartedAt: stamp() });
+ const guardedPatch = async (fields, step, prev) => {
+  // Record when this PATCH starts BEFORE sending it, on the server clock (the
+  // Date of the GET just before it, prev). If that fails, nothing is sent
+  // and the lock is released normally.
+  lock.mark?.({ state: 'patching', step, patchStartedAt: stamp(), patchServerStart: serverIso(prev, `the ${step} PATCH`) });
   try { return await patch(fields); }
   catch (e) {
    if (definitePatchFailure(e)) throw e;
@@ -161,9 +201,13 @@ export async function claimItem({ owner, get, patch, save, lock, item }) {
  try {
   const r = await get();
   if (r.fields.Status !== 'Ready' || r.fields['Claimed By']) return { action: 'skip', status: r.fields.Status, claimed: !!r.fields['Claimed By'] };
-  await guardedPatch({ 'Claimed By': owner, 'Claimed At': new Date().toISOString() }, 'owner');
-  if ((await get()).fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
-  await guardedPatch({ Status: 'Doing' }, 'doing');
+  // Server-clock acquisition stamp, before any PATCH: a lock left in state
+  // 'claiming' is measured from it (and must still read Ready/unclaimed).
+  lock.mark?.({ acquiredServerAt: serverIso(r, 'the owner PATCH') });
+  await guardedPatch({ 'Claimed By': owner, 'Claimed At': new Date().toISOString() }, 'owner', r);
+  const rb = await get();
+  if (rb.fields['Claimed By'] !== owner) throw Error('Claim readback mismatch');
+  await guardedPatch({ Status: 'Doing' }, 'doing', rb);
   save(owner);
   return { action: 'claimed', owner };
  } catch (e) {

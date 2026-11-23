@@ -72,6 +72,14 @@ if (adopt) {
   console.log(JSON.stringify(out));if(out.action==='refused')process.exitCode=3;
  }else if(cmd==='checkpoint'){`);
 }
+if (adopt) {
+	// Adoption also needs the reads to carry Airtable's Date header as serverDate
+	// (the same change as scripts/gate8/airtable-api.mjs).
+	const apiFile = path.join(code, 'gate8-airtable-api.mjs'); let api = fs.readFileSync(apiFile, 'utf8');
+	const from = `const value=await response.json();`;
+	if (api.split(from).length !== 2) { console.error('airtable-api rewrite anchor not unique'); process.exit(2); }
+	fs.writeFileSync(apiFile, api.replace(from, `${from}if(method==='GET'&&value&&typeof value==='object'){const date=response.headers?.get?.('date');if(date)value.serverDate=date;}`));
+}
 fs.writeFileSync(path.join(code, 'gate8-queue.mjs'), src);
 fs.writeFileSync(path.join(code, 'stub-claim.mjs'), 'export function writeClaim(){}\n');
 fs.writeFileSync(path.join(tmp, 'fake-airtable.yaml'), 'AIRTABLE_TOKEN: local-fake-not-a-token\n');

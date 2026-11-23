@@ -28,7 +28,15 @@
 (*                TIMING ASSUMPTION that CLEAR_QUIESCENCE_MS (10 min after *)
 (*                the last PATCH started) outlasts every in-flight PATCH.  *)
 (*                TLC does not check that assumption; it checks that, if   *)
-(*                it holds, clearing never yields two owners.              *)
+(*                it holds, clearing never yields two owners. The window   *)
+(*                is measured on AIRTABLE'S clock (HTTP Date of the GET    *)
+(*                before the PATCH vs. Date of the clear's own reads), so  *)
+(*                the model has no local clock: a local wall-clock jump    *)
+(*                cannot enable Clear. A lock without a server-clock start *)
+(*                (older claim.mjs format) is never cleared, i.e. Clear is *)
+(*                simply not taken. The explorer (explore.mjs) exercises   *)
+(*                the local-clock jump on the real code; mutant M10 there  *)
+(*                (window on the local clock) is KILLED.                   *)
 (*                                                                         *)
 (* Flags model the guards so a mutation is a one-line cfg change:          *)
 (*   UseLock          the claim lock                                       *)
@@ -208,8 +216,10 @@ Crash(c) ==
 \* clearAmbiguousLock: the operator removes the lock of a claimer that ended
 \* after an ambiguous PATCH or crashed (never a running claimer). With
 \* ClearWaits, only when none of c's PATCHes is still in flight; this stands
-\* for "CLEAR_QUIESCENCE_MS has passed since the last PATCH started", which
-\* is an assumption about Airtable, not something TLC can check.
+\* for "CLEAR_QUIESCENCE_MS of Airtable time has passed since the last PATCH
+\* started", which is an assumption about Airtable, not something TLC can
+\* check. Measuring on Airtable's clock is what makes this abstraction sound
+\* under local clock jumps; it is not modelled as a separate variable.
 Clear(c) ==
     /\ AllowClear /\ held[c] /\ pc[c] \in {"operator", "crashed"}
     /\ ClearWaits => c \notin pendOwner \cup pendDoing
