@@ -20,6 +20,17 @@
  * code between two awaits. DFS enumerates every choice sequence; the shortest
  * violating sequence is printed as numbered steps.
  *
+ * Scenario claim-x2-clear adds the operator: one run of the REAL
+ * clearAmbiguousLock (`gate8-queue.mjs clear-ambiguous`) as a step at any
+ * point, its settle pause as a separate step (delayed PATCHes may land
+ * between its two reads), and one virtual-clock step that advances time by
+ * CLEAR_QUIESCENCE_MS. The clock step is enabled only when no delayed PATCH
+ * is still in flight: that is the TIMING ASSUMPTION behind the window (no
+ * PATCH is applied later than CLEAR_QUIESCENCE_MS after it started). The
+ * explorer cannot check that assumption; it checks that, if it holds, a
+ * clear never yields two owners. Mutant M8 (no window) shows what happens
+ * without it.
+ *
  * Usage: node explore.mjs [--lib <dir with claim.mjs>] [--scenario <name>|all]
  * Exit 0 = rule held in every schedule AND witnesses reached; 1 = violation,
  * vacuity or truncation; 2 = error.
@@ -35,7 +46,7 @@ const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] :
 const libDir = path.resolve(opt('--lib', path.join(here, '../../scripts/gate8')));
 const which = opt('--scenario', 'all');
 const MAX = Number(opt('--max-schedules', '200000'));
-const { claimItem, fileClaimLock } = await import(pathToFileURL(path.join(libDir, 'claim.mjs')).href);
+const { claimItem, fileClaimLock, clearAmbiguousLock, CLEAR_QUIESCENCE_MS } = await import(pathToFileURL(path.join(libDir, 'claim.mjs')).href);
 
 const SCENARIOS = {
 	// Two scheduled sessions claim the same Ready item.
@@ -47,6 +58,9 @@ const SCENARIOS = {
 	// First claimer's local state save throws after both PATCHes landed.
 	'claim-x2-savefail': { actors: 2, faults: false, saveFails: [1] },
 	'claim-x3': { actors: 3, faults: false, saveFails: [] },
+	// Operator clear (real clearAmbiguousLock) + one clock tick past the window.
+	// Claimer 2 has no PATCH faults, which bounds the state space.
+	'claim-x2-clear': { actors: 2, faults: true, faultsFor: [1], clear: true, saveFails: [] },
 };
 
 const drain = async () => { for (let i = 0; i < 3; i++) await new Promise(r => setImmediate(r)); };
@@ -56,13 +70,16 @@ let runNo = 0;
 
 async function execute(sc, prefix) {
 	const lockDir = path.join(tmpRoot, String(runNo++)); fs.mkdirSync(lockDir);
-	const real = fileClaimLock(path.join(lockDir, 'gate8-claim.lock'));
+	const clock = { t: Date.parse('2026-11-22T10:00:00Z') };
+	const real = fileClaimLock(path.join(lockDir, 'gate8-claim.lock'), { now: () => clock.t });
 	const acquired = new Map(); // owner -> what the real acquire() returned (observation only)
 	const lock = { ...real, acquire: o => { const v = real.acquire(o); acquired.set(o, v); return v; } };
 	const record = { fields: { Status: 'Ready', 'Claimed By': '' } };
 	const ops = []; const log = []; const choices = [];
 	const winners = []; let violationAt = -1;
-	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0 };
+	const ev = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, claimAfterClear: 0 };
+	let clearedOnce = false;
+	const delayedPending = () => ops.some(o => o.delayed);
 	let ambiguousSeen = false;
 	const show = () => `{Status:${record.fields.Status}, Claimed By:${record.fields['Claimed By'] || '(none)'}}`;
 	const check = () => {
@@ -79,13 +96,13 @@ async function execute(sc, prefix) {
 			const p = `${who} PATCH ${JSON.stringify(shown)}`;
 			const group = {};
 			const alts = [{ label: `${p} -> `, fire: () => { apply(); resolve(structuredClone(record)); return show(); } }];
-			if (sc.faults) {
+			if (sc.faults && (!sc.faultsFor || sc.faultsFor.includes(Number(who.slice(-1))))) {
 				alts.push({ label: `${p} applied, response LOST (timeout) -> `, fire: () => { apply(); ev.lostResponse++; ambiguousSeen = true; reject(ambiguous('response lost')); return show(); } });
 				alts.push({ label: `${p} REJECTED HTTP 422, not applied -> `, fire: () => { ev.failedPatch++; reject(Object.assign(Error('HTTP 422'), { httpStatus: 422 })); return show(); } });
 				alts.push({ label: `${p} TIMED OUT, never applied -> `, fire: () => { ambiguousSeen = true; reject(ambiguous('timeout')); return show(); } });
 				if (!sc.noDelayed) alts.push({ label: `${p} TIMED OUT (request still in flight) -> `, fire: () => {
 					ambiguousSeen = true; reject(ambiguous('timeout'));
-					ops.push({ label: `${who}'s delayed PATCH ${JSON.stringify(shown)} is applied by the store -> `, fire: () => { apply(); ev.delayedLanded++; return show(); } });
+					ops.push({ delayed: true, label: `${who}'s delayed PATCH ${JSON.stringify(shown)} is applied by the store -> `, fire: () => { apply(); ev.delayedLanded++; return show(); } });
 					return show();
 				} });
 			}
@@ -98,20 +115,36 @@ async function execute(sc, prefix) {
 			const s = store(who);
 			claimItem({ owner, get: s.get, patch: s.patch, lock, save: () => { if (sc.saveFails.includes(i)) throw Error('state save failed'); } })
 				.then(out => {
-					if (out.action === 'claimed') { ev.claimed++; winners.push(owner); log.push(`${who} returns action:"claimed"`); check(); }
+					if (out.action === 'claimed') { ev.claimed++; if (clearedOnce) ev.claimAfterClear++; winners.push(owner); log.push(`${who} returns action:"claimed"`); check(); }
 					else if (out.action === 'needs-operator') { ev.needsOperator++; log.push(`${who} returns needs-operator (lock kept: ${out.reason})`); }
 					else { if (out.reason === 'claim-lock-held') ev.skipLock++; else ev.skipStatus++; log.push(`${who} returns skip (${out.reason ?? 'status ' + out.status + ', claimed=' + out.claimed})`); }
 				}, e => { ev.threw++; log.push(`${who} throws: ${e.message}`); });
 			return `lock.acquire() returned ${acquired.get(owner)}`;
 		} });
 	}
+	if (sc.clear) {
+		ops.push({ label: `clock advances CLEAR_QUIESCENCE_MS (${CLEAR_QUIESCENCE_MS / 60000} min; assumption: no PATCH still in flight) -> `,
+			enabled: () => !delayedPending(), fire: () => { clock.t += CLEAR_QUIESCENCE_MS; return `now ${new Date(clock.t).toISOString()}`; } });
+		ops.push({ label: 'operator runs gate8-queue.mjs clear-ambiguous -> ', fire: () => {
+			const s = store('operator');
+			const pause = () => new Promise(resolve => ops.push({ label: 'operator settle pause between the two reads ends -> ', fire: () => { resolve(); return show(); } }));
+			clearAmbiguousLock({ lock: real, item: undefined, get: s.get, pause, now: () => clock.t })
+				.then(out => {
+					if (out.action === 'cleared') { ev.cleared++; clearedOnce = true; log.push(`operator clear: cleared (patchLanded=${out.patchLanded})`); }
+					else { if (out.action === 'refused') ev.clearRefused++; log.push(`operator clear: ${out.action}${out.reason ? ' (' + out.reason + ')' : ''}`); }
+				}, e => { log.push(`operator clear throws: ${e.message}`); });
+			return 'started';
+		} });
+	}
 	let step = 0;
 	for (;;) {
 		await drain();
 		if (ops.length === 0) break;
+		const en = ops.filter(o => !o.enabled || o.enabled());
+		if (en.length === 0) throw Error('no enabled step');
 		const chosen = step < prefix.length ? prefix[step] : 0;
-		choices.push({ chosen, enabled: ops.length });
-		const op = ops[chosen];
+		choices.push({ chosen, enabled: en.length });
+		const op = en[chosen];
 		// Remove the chosen op and its fault siblings.
 		for (let j = ops.length - 1; j >= 0; j--) if (ops[j] === op || (op.group && ops[j].group === op.group)) ops.splice(j, 1);
 		log.push(op.label + op.fire());
@@ -129,7 +162,7 @@ async function execute(sc, prefix) {
 
 async function explore(sc) {
 	let prefix = [], schedules = 0, shortest = null, maxDepth = 0;
-	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0 };
+	const reached = { claimed: 0, skipLock: 0, skipStatus: 0, lostResponse: 0, failedPatch: 0, threw: 0, delayedLanded: 0, needsOperator: 0, keptLock: 0, cleared: 0, clearRefused: 0, claimAfterClear: 0 };
 	for (;;) {
 		const r = await execute(sc, prefix); schedules++;
 		maxDepth = Math.max(maxDepth, r.choices.length);
@@ -151,7 +184,7 @@ for (const name of names) {
 	if (!sc) { console.error(`unknown scenario ${name}`); process.exit(2); }
 	const res = await explore(sc);
 	const want = { claimed: true, skipLock: true, skipStatus: true, lostResponse: sc.faults, failedPatch: sc.faults, threw: sc.faults || sc.saveFails.length > 0,
-		delayedLanded: sc.faults && !sc.noDelayed, needsOperator: sc.faults, keptLock: sc.faults };
+		delayedLanded: sc.faults && !sc.noDelayed, needsOperator: sc.faults, keptLock: sc.faults, cleared: !!sc.clear, clearRefused: !!sc.clear, claimAfterClear: !!sc.clear };
 	const vacuous = Object.entries(want).filter(([k, w]) => w && res.reached[k] === 0).map(([k]) => k);
 	const bad = res.shortest !== null || res.truncated || vacuous.length > 0;
 	failed ||= bad;

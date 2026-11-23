@@ -38,16 +38,24 @@ open(f,'w').write(s)
 }
 
 # M1: no lock (= the original helper: GET check, PATCH owner, readback, PATCH Doing).
-mutant M1-no-lock claim-x2 "sub('''   try { fs.linkSync(tmp, lockPath); return true; }''', '''   try { fs.rmSync(tmp, { force: true }); return true; }''')"
+# The original also had no lock metadata, so mark() becomes a no-op too (with
+# mark() active, its lost-lock check alone would stop every claim: ELOCKLOST).
+NO_MARK="sub('''  mark(fields) {
+''', '''  mark(fields) { return;
+''')"
+mutant M1-no-lock claim-x2 "sub('''   try { fs.linkSync(tmp, lockPath); return true; }''', '''   try { fs.rmSync(tmp, { force: true }); return true; }''')
+$NO_MARK"
 
 # M2: lock kept, Ready/unclaimed check removed: a later claimer overwrites the owner.
 mutant M2-no-status-check claim-x2 "sub('''  if (r.fields.Status !== 'Ready' || r.fields['Claimed By']) return''', '''  if (false) return''')"
 
-# M3: lock released right after the Ready check, before the owner PATCH.
+# M3: lock released right after the Ready check, before the owner PATCH
+# (mark() disabled as in M1; otherwise the lost-lock check stops the claim).
 mutant M3-early-release claim-x2 "sub('''  const r = await get();
 ''', '''  const r = await get();
   lock.release();
-''')"
+''')
+$NO_MARK"
 
 # M4: lock kept, readback removed. EQUIVALENT for this rule within these
 # bounds: under the lock no other claimer can write between PATCH and
@@ -71,6 +79,18 @@ mutant M6-timeout-as-definite claim-x2-delayed "sub('''export const definitePatc
 # lock check (LEAK) must catch it.
 mutant M7-keep-on-definite claim-x2-faults "sub('''   if (definitePatchFailure(e)) throw e;
    keep = true;''', '''   keep = true;''')"
+
+# M8: clear-ambiguous without the quiescence window (= the old advice:
+# remove the lock once no claimer is running). A delayed PATCH lands after the
+# clear and overwrites the next claimer (the reviewer's loopback reproduction).
+mutant M8-clear-no-window claim-x2-clear "sub('''  if (waited < quiescenceMs) return''', '''  if (false) return''')"
+
+# M9: clear-ambiguous without the second (settle) read. EQUIVALENT under the
+# explorer's timing assumption (no PATCH is in flight once the window has
+# passed), so it is expected to survive. The double read is defence in depth
+# for a store that breaks that assumption; tests/gate8/claim.test.mjs covers
+# it directly ("a PATCH landing between the two settle reads is detected").
+mutant M9-clear-single-read claim-x2-clear "sub('''  const r1 = await get(); await pause(settleMs); const r2 = await get();''', '''  const r2 = await get(); const r1 = r2;''')" survives
 
 echo "### baseline (unmutated scripts/gate8/claim.mjs)"
 node "$here/explore.mjs" --lib "$root/scripts/gate8"; rc=$?

@@ -21,8 +21,11 @@
  * readback, Doing PATCH, save) with the lane fix: claimItem() from
  * scripts/gate8/claim.mjs under fileClaimLock(root+'/gate8-claim.lock'). The
  * server then answers in arrival order (the scripted order cannot happen
- * once B is refused by the lock). Exit 0 = exactly one process claimed and
- * the other skipped; 1 otherwise.
+ * once B is refused by the lock). It also adds the operator command
+ * `clear-ambiguous <item>` (clearAmbiguousLock under the same lock path) as
+ * a new branch, and runs it once after both claims: with no lock left it must
+ * answer "no-lock". Exit 0 = exactly one process claimed, the other skipped
+ * and clear-ambiguous answered; 1 otherwise.
  * Not part of run.sh: the helper is untracked local history (gitignored).
  */
 import fs from 'node:fs';
@@ -60,8 +63,14 @@ if (adopt) {
   await patch({'Claimed By':owner,'Claimed At':new Date().toISOString()});
   if((await get()).fields['Claimed By']!==owner)throw Error('Claim readback mismatch');
   await patch({Status:'Doing'});s.owner=owner;save(s);`, `  const {claimItem,fileClaimLock}=await import(${JSON.stringify(claimUrl)});
-  const out=await claimItem({owner,get,patch,lock:fileClaimLock(root+'/gate8-claim.lock'),save:o=>{s.owner=o;save(s);}});
+  const out=await claimItem({owner,get,patch,item:s.recordId,lock:fileClaimLock(root+'/gate8-claim.lock'),save:o=>{s.owner=o;save(s);}});
   if(out.action!=='claimed'){console.log(JSON.stringify(out));process.exit(0);}`);
+	sub(`}else if(cmd==='checkpoint'){`, `}else if(cmd==='clear-ambiguous'){
+  if(process.argv[3]!==s.recordId)throw Error('clear-ambiguous requires the item record id');
+  const {clearAmbiguousLock,fileClaimLock}=await import(${JSON.stringify(claimUrl)});
+  const out=await clearAmbiguousLock({lock:fileClaimLock(root+'/gate8-claim.lock'),item:s.recordId,get});
+  console.log(JSON.stringify(out));if(out.action==='refused')process.exitCode=3;
+ }else if(cmd==='checkpoint'){`);
 }
 fs.writeFileSync(path.join(code, 'gate8-queue.mjs'), src);
 fs.writeFileSync(path.join(code, 'stub-claim.mjs'), 'export function writeClaim(){}\n');
@@ -111,9 +120,18 @@ console.log('fake-store request order:'); log.forEach(l => console.log('  ' + l)
 for (const p of [a, b]) console.log(`process ${p.who} (${p.owner}) rc=${p.rc} stdout=${p.out}${p.err ? ' stderr=' + p.err.split('\n')[0] : ''}`);
 console.log(`final record: Status=${record.fields.Status} Claimed By=${record.fields['Claimed By']}; local state owner=${state.owner}`);
 const claimedN = [a, b].filter(p => p.rc === 0 && /"action":"claimed"/.test(p.out)).length;
+let clear = null;
+if (adopt) {
+	const srv = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(record)); });
+	await new Promise(r => srv.listen(0, '127.0.0.1', r));
+	clear = await new Promise(resolve => { const p = spawn(process.execPath, [path.join(code, 'gate8-queue.mjs'), 'clear-ambiguous', fixture.recordId], {env: {...process.env, FAKE_BASE: `http://127.0.0.1:${srv.address().port}/op`}, stdio: ['ignore', 'pipe', 'pipe']});
+		let out = ''; p.stdout.on('data', c => out += c); p.on('close', rc => resolve({rc, out: out.trim()})); });
+	srv.close();
+	console.log(`clear-ambiguous ${fixture.recordId}: rc=${clear.rc} ${clear.out}`);
+}
 fs.rmSync(tmp, {recursive: true, force: true});
 if (adopt) {
-	const ok = claimedN === 1 && [a, b].some(p => p.rc === 0 && /"action":"skip"/.test(p.out)) && state.owner === record.fields['Claimed By'];
+	const ok = clear.rc === 0 && /"action":"no-lock"/.test(clear.out) && claimedN === 1 && [a, b].some(p => p.rc === 0 && /"action":"skip"/.test(p.out)) && state.owner === record.fields['Claimed By'];
 	console.log(ok ? 'FIX HOLDS: exactly one process claimed; the other skipped; record owner = local owner' : 'FIX FAILED');
 	process.exit(ok ? 0 : 1);
 }
